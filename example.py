@@ -1,6 +1,5 @@
-from TICC_solver import TICC
+from ticc.TICC_solver import TICC
 import numpy as np
-import sys
 
 fname = "example_data.txt"
 ticc = TICC(window_size=1, number_of_clusters=8, lambda_parameter=11e-2, beta=600, maxIters=100, threshold=2e-5,

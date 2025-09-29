@@ -8,8 +8,8 @@ from sklearn.cluster import KMeans
 import pandas as pd
 from multiprocessing import Pool
 
-from src.TICC_helper import *
-from src.admm_solver import ADMMSolver
+from ticc.TICC_helper import *
+from ticc.admm_solver import ADMMSolver
 
 
 

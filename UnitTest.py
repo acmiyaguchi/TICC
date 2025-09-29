@@ -1,5 +1,5 @@
 import unittest
-from TICC_solver import TICC
+from ticc.TICC_solver import TICC
 import numpy as np
 import sys
 
