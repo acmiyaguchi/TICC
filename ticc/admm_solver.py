@@ -1,5 +1,59 @@
 import numpy
 import math
+from numba import jit
+
+@jit(nopython=True)
+def _ij2symmetric(i,j,size):
+    return (size * (size + 1))/2 - (size-i)*((size - i + 1))/2 + j - i
+
+@jit(nopython=True)
+def _jitted_ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
+    a = x + u
+    probSize = numBlocks*sizeBlocks
+    z_update = numpy.zeros(length)
+
+    for i in range(numBlocks):
+        elems = numBlocks if i==0 else (2*numBlocks - 2*i)/2 # i=0 is diagonal
+        for j in range(sizeBlocks):
+            startPoint = j if i==0 else 0
+            for k in range(startPoint, sizeBlocks):
+                # locList = [((l+i)*sizeBlocks + j, l*sizeBlocks+k) for l in range(int(elems))]
+                locList_0 = numpy.array([(l+i)*sizeBlocks + j for l in range(int(elems))])
+                locList_1 = numpy.array([l*sizeBlocks+k for l in range(int(elems))])
+                if i == 0:
+                    lamSum = 0
+                    for idx in range(len(locList_0)):
+                        lamSum += lamb[locList_0[idx], locList_1[idx]]
+
+                    indices = numpy.zeros(len(locList_0))
+                    for idx in range(len(locList_0)):
+                        indices[idx] = _ij2symmetric(locList_0[idx], locList_1[idx], probSize)
+                else:
+                    lamSum = 0
+                    for idx in range(len(locList_0)):
+                        lamSum += lamb[locList_1[idx], locList_0[idx]]
+
+                    indices = numpy.zeros(len(locList_0))
+                    for idx in range(len(locList_0)):
+                        indices[idx] = _ij2symmetric(locList_1[idx], locList_0[idx], probSize)
+
+                pointSum = 0
+                for index in indices:
+                    pointSum += a[int(index)]
+                rhoPointSum = rho * pointSum
+
+                #Calculate soft threshold
+                ans = 0
+                #If answer is positive
+                if rhoPointSum > lamSum:
+                    ans = max((rhoPointSum - lamSum)/(rho*elems),0)
+                elif rhoPointSum < -1*lamSum:
+                    ans = min((rhoPointSum + lamSum)/(rho*elems),0)
+
+                for index in indices:
+                    z_update[int(index)] = ans
+    return z_update
+
 class ADMMSolver:
     def __init__(self, lamb, num_stacked, size_blocks, rho, S, rho_update_func=None):
         self.lamb = lamb
@@ -15,25 +69,22 @@ class ADMMSolver:
         self.status = 'initialized'
         self.rho_update_func = rho_update_func
 
-    def ij2symmetric(self, i,j,size):
-        return (size * (size + 1))/2 - (size-i)*((size - i + 1))/2 + j - i
-
     def upper2Full(self, a):
-        n = int((-1  + numpy.sqrt(1+ 8*a.shape[0]))/2)  
+        n = int((-1  + numpy.sqrt(1+ 8*a.shape[0]))/2)
         A = numpy.zeros([n,n])
-        A[numpy.triu_indices(n)] = a 
+        A[numpy.triu_indices(n)] = a
         temp = A.diagonal()
-        A = (A + A.T) - numpy.diag(temp)             
-        return A 
+        A = (A + A.T) - numpy.diag(temp)
+        return A
 
     def Prox_logdet(self, S, A, eta):
         d, q = numpy.linalg.eigh(eta*A-S)
         q = numpy.matrix(q)
         X_var = ( 1/(2*float(eta)) )*q*( numpy.diag(d + numpy.sqrt(numpy.square(d) + (4*eta)*numpy.ones(d.shape))) )*q.T
-        x_var = X_var[numpy.triu_indices(S.shape[1])] # extract upper triangular part as update variable      
+        x_var = X_var[numpy.triu_indices(S.shape[1])] # extract upper triangular part as update variable
         return numpy.matrix(x_var).T
 
-    def ADMM_x(self):    
+    def ADMM_x(self):
         a = self.z-self.u
         A = self.upper2Full(a)
         eta = self.rho
@@ -41,37 +92,7 @@ class ADMMSolver:
         self.x = numpy.array(x_update).T.reshape(-1)
 
     def ADMM_z(self, index_penalty = 1):
-        a = self.x + self.u
-        probSize = self.numBlocks*self.sizeBlocks
-        z_update = numpy.zeros(self.length)
-
-        # TODO: can we parallelize these?
-        for i in range(self.numBlocks):
-            elems = self.numBlocks if i==0 else (2*self.numBlocks - 2*i)/2 # i=0 is diagonal
-            for j in range(self.sizeBlocks):
-                startPoint = j if i==0 else 0
-                for k in range(startPoint, self.sizeBlocks):
-                    locList = [((l+i)*self.sizeBlocks + j, l*self.sizeBlocks+k) for l in range(int(elems))]
-                    if i == 0:
-                        lamSum = sum(self.lamb[loc1, loc2] for (loc1, loc2) in locList)
-                        indices = [self.ij2symmetric(loc1, loc2, probSize) for (loc1, loc2) in locList]
-                    else:
-                        lamSum = sum(self.lamb[loc2, loc1] for (loc1, loc2) in locList)
-                        indices = [self.ij2symmetric(loc2, loc1, probSize) for (loc1, loc2) in locList]
-                    pointSum = sum(a[int(index)] for index in indices)
-                    rhoPointSum = self.rho * pointSum
-
-                    #Calculate soft threshold
-                    ans = 0
-                    #If answer is positive
-                    if rhoPointSum > lamSum:
-                        ans = max((rhoPointSum - lamSum)/(self.rho*elems),0)
-                    elif rhoPointSum < -1*lamSum:
-                        ans = min((rhoPointSum + lamSum)/(self.rho*elems),0)
-
-                    for index in indices:
-                        z_update[int(index)] = ans
-        self.z = z_update
+        self.z = _jitted_ADMM_z(self.x, self.u, self.lamb, self.rho, self.numBlocks, self.sizeBlocks, self.length)
 
     def ADMM_u(self):
         u_update = self.u + self.x - self.z

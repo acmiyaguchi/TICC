@@ -1,5 +1,5 @@
 import numpy as np
-
+from numba import jit
 
 def getTrainTestSplit(m, num_blocks, num_stacked):
     '''
@@ -26,15 +26,20 @@ def getTrainTestSplit(m, num_blocks, num_stacked):
     return sorted(training_idx)
 
 
+@jit(nopython=True)
 def upperToFull(a, eps=0):
-        ind = (a < eps) & (a > -eps)
-        a[ind] = 0
-        n = int((-1 + np.sqrt(1 + 8*a.shape[0]))/2)
-        A = np.zeros([n, n])
-        A[np.triu_indices(n)] = a
-        temp = A.diagonal()
-        A = np.asarray((A + A.T) - np.diag(temp))
-        return A
+    ind = (a < eps) & (a > -eps)
+    # a[ind] = 0
+    a_copy = a.copy()
+    a_copy[ind] = 0
+    n = int((-1 + np.sqrt(1 + 8*a.shape[0]))/2)
+    A = np.zeros((n, n))
+    # A[np.triu_indices(n)] = a
+    rows, cols = np.triu_indices(n)
+    for i in range(len(a_copy)):
+        A[rows[i], cols[i]] = a_copy[i]
+    A = (A + A.T) - np.diag(np.diag(A))
+    return A
 
 
 def hex_to_rgb(value):
@@ -45,6 +50,7 @@ def hex_to_rgb(value):
     return out
 
 
+@jit(nopython=True)
 def updateClusters(LLE_node_vals, switch_penalty=1):
     """
     Takes in LLE_node_vals matrix and computes the path that minimizes
@@ -88,6 +94,7 @@ def updateClusters(LLE_node_vals, switch_penalty=1):
     return path
 
 
+@jit(nopython=True)
 def find_matching(confusion_matrix):
     """
     returns the perfect matching
@@ -143,12 +150,13 @@ def computeF1Score_delete(num_cluster, matching_algo, actual_clusters, threshold
     return F1_score
 
 
+@jit(nopython=True)
 def compute_confusion_matrix(num_clusters, clustered_points_algo, sorted_indices_algo):
     """
     computes a confusion matrix and returns it
     """
     seg_len = 400
-    true_confusion_matrix = np.zeros([num_clusters, num_clusters])
+    true_confusion_matrix = np.zeros((num_clusters, num_clusters))
     for point in range(len(clustered_points_algo)):
         cluster = clustered_points_algo[point]
         num = (int(sorted_indices_algo[point]/seg_len) % num_clusters)
@@ -163,7 +171,7 @@ def computeF1_macro(confusion_matrix, matching, num_clusters):
     matching according to which matrix must be permuted
     """
     # Permute the matrix columns
-    permuted_confusion_matrix = np.zeros([num_clusters, num_clusters])
+    permuted_confusion_matrix = np.zeros((num_clusters, num_clusters))
     for cluster in range(num_clusters):
         matched_cluster = matching[cluster]
         permuted_confusion_matrix[:, cluster] = confusion_matrix[:, matched_cluster]

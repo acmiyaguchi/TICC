@@ -10,6 +10,7 @@ from multiprocessing import Pool
 
 from ticc.TICC_helper import *
 from ticc.admm_solver import ADMMSolver
+import tqdm
 
 
 
@@ -57,7 +58,10 @@ class TICC:
         self.log_parameters()
 
         # Get data into proper format
+        start = time.time()
         times_series_arr, time_series_rows_size, time_series_col_size = self.load_data(input_file)
+        end = time.time()
+        print("loading data took:", end - start)
 
         ############
         # The basic folder to be created
@@ -69,19 +73,29 @@ class TICC:
         num_train_points = len(training_indices)
 
         # Stack the training data
+        start = time.time()
         complete_D_train = self.stack_training_data(times_series_arr, time_series_col_size, num_train_points,
                                                     training_indices)
+        end = time.time()
+        print("stacking data took:", end - start)
 
         # Initialization
         # Gaussian Mixture
+        start = time.time()
         gmm = mixture.GaussianMixture(n_components=self.number_of_clusters, covariance_type="full")
         gmm.fit(complete_D_train)
         clustered_points = gmm.predict(complete_D_train)
+        end = time.time()
+        print(f"GMM initialization took {end - start:.4f} seconds")
         gmm_clustered_pts = clustered_points + 0
         # K-means
+        
+        start = time.time()
         kmeans = KMeans(n_clusters=self.number_of_clusters, random_state=0).fit(complete_D_train)
         clustered_points_kmeans = kmeans.labels_  # todo, is there a difference between these two?
         kmeans_clustered_pts = kmeans.labels_
+        end = time.time()
+        print(f"K-means initialization took {end - start:.4f} seconds")
 
         train_cluster_inverse = {}
         log_det_values = {}  # log dets of the thetas
@@ -94,8 +108,7 @@ class TICC:
 
         # PERFORM TRAINING ITERATIONS
         pool = Pool(processes=self.num_proc)  # multi-threading
-        for iters in range(self.maxIters):
-            print("\n\n\nITERATION ###", iters)
+        for iters in tqdm.tqdm(range(self.maxIters)):
             # Get the train and test points
             train_clusters_arr = collections.defaultdict(list)  # {cluster: [point indices]}
             for point, cluster_num in enumerate(clustered_points):
@@ -361,7 +374,8 @@ class TICC:
         return str_NULL
 
     def load_data(self, input_file):
-        Data = np.loadtxt(input_file, delimiter=",")
+        df = pd.read_csv(input_file)
+        Data = df.values
         (m, n) = Data.shape  # m: num of observations, n: size of observation vector
         print("completed getting the data")
         return Data, m, n
