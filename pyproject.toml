@@ -9,6 +9,8 @@ dependencies = [
     "numpy",
     "pandas",
     "scikit-learn",
+    "numba",
+    "tqdm",
 ]
 
 [build-system]
