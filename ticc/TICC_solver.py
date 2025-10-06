@@ -15,43 +15,6 @@ from ticc.admm_solver import ADMMSolver
 import tqdm
 
 
-@jit(nopython=True)
-def _smoothen_clusters_jit(
-    complete_D_train,
-    num_clusters,
-    window_size,
-    n,
-    cluster_means_stacked,
-    inv_cov_matrices,
-    log_det_covs,
-):
-    clustered_points_len = len(complete_D_train)
-    LLE_all_points_clusters = np.zeros((clustered_points_len, num_clusters))
-    num_blocks = window_size + 1
-
-    for point in range(clustered_points_len):
-        if point + window_size - 1 < complete_D_train.shape[0]:
-            for cluster in range(num_clusters):
-                cluster_mean_stacked = cluster_means_stacked[cluster]
-                x = (
-                    complete_D_train[point, :]
-                    - cluster_mean_stacked[0 : (num_blocks - 1) * n]
-                )
-                inv_cov_matrix = inv_cov_matrices[cluster]
-                log_det_cov = log_det_covs[cluster]
-
-                x_reshaped = x.reshape(1, (num_blocks - 1) * n)
-
-                # Perform np.dot(x_reshaped, np.dot(inv_cov_matrix, x_reshaped.T))
-                # This is faster in numba
-                tmp = np.dot(inv_cov_matrix, x_reshaped.T)
-                lle = np.dot(x_reshaped, tmp) + log_det_cov
-
-                LLE_all_points_clusters[point, cluster] = lle[0, 0]
-
-    return LLE_all_points_clusters
-
-
 class TICC:
     def __init__(
         self,
@@ -435,45 +398,45 @@ class TICC:
 
     def smoothen_clusters(
         self,
-        cluster_mean_info,
         computed_covariance,
         cluster_mean_stacked_info,
         complete_D_train,
         n,
     ):
-        inv_cov_matrices = np.zeros(
-            (
-                self.number_of_clusters,
-                (self.num_blocks - 1) * n,
-                (self.num_blocks - 1) * n,
-            )
-        )
-        log_det_covs = np.zeros(self.number_of_clusters)
-        cluster_means_stacked = np.zeros(
-            (self.number_of_clusters, complete_D_train.shape[1])
-        )
+        """
+        Vectorized LLE calculation using NumPy.
+        This is significantly faster than the original looped version.
+        """
+        num_clusters = self.number_of_clusters
+        D = self.window_size * n
+        T = complete_D_train.shape[0]
 
-        for cluster in range(self.number_of_clusters):
-            cov_matrix = computed_covariance[self.number_of_clusters, cluster][
-                0 : (self.num_blocks - 1) * n, 0 : (self.num_blocks - 1) * n
-            ]
+        # Use np for all operations
+        inv_cov_matrices = np.zeros((num_clusters, D, D))
+        log_det_covs = np.zeros(num_clusters)
+        cluster_means_stacked = np.zeros((num_clusters, D))
+
+        for cluster in range(num_clusters):
+            cov_matrix = computed_covariance[self.number_of_clusters, cluster]
             inv_cov_matrices[cluster] = np.linalg.inv(cov_matrix)
-            log_det_covs[cluster] = np.log(np.linalg.det(cov_matrix))
-            cluster_means_stacked[cluster] = cluster_mean_stacked_info[
-                self.number_of_clusters, cluster
-            ]
+            # Use slogdet for better numerical stability with small determinants
+            sign, log_det = np.linalg.slogdet(cov_matrix)
+            log_det_covs[cluster] = log_det if sign > 0 else -np.inf
+            cluster_means_stacked[cluster] = cluster_mean_stacked_info[self.number_of_clusters, cluster]
 
-        print("beginning the smoothening ALGORITHM")
+        LLE_all_points_clusters = np.zeros((T, num_clusters))
 
-        LLE_all_points_clusters = _smoothen_clusters_jit(
-            complete_D_train,
-            self.number_of_clusters,
-            self.window_size,
-            n,
-            cluster_means_stacked,
-            inv_cov_matrices,
-            log_det_covs,
-        )
+        # Vectorized LLE Calculation (replaces the slow loop)
+        for cluster in range(num_clusters):
+            # X_minus_mu is a (T x D) matrix of deviations from the mean
+            X_minus_mu = complete_D_train - cluster_means_stacked[cluster]
+
+            # np.einsum is a highly optimized way to compute the quadratic form
+            # (x^T * Theta * x) for all points at once. This avoids creating
+            # massive intermediate matrices and is much faster than a loop.
+            quadratic_form = np.einsum('ij,jk,ik->i', X_minus_mu, inv_cov_matrices[cluster], X_minus_mu)
+
+            LLE_all_points_clusters[:, cluster] = quadratic_form + log_det_covs[cluster]
 
         return LLE_all_points_clusters
 
