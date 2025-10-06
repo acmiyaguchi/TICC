@@ -11,6 +11,8 @@ dependencies = [
     "scikit-learn",
     "numba",
     "tqdm",
+    "gmmx",
+    "faiss-cpu",
 ]
 
 [build-system]
