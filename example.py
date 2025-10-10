@@ -1,4 +1,4 @@
-from ticc.TICC_solver_functional import fit
+from ticc.TICC_solver import fit
 import numpy as np
 
 if __name__ == "__main__":
