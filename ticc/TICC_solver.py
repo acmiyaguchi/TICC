@@ -2,7 +2,6 @@
 This file contains a functional implementation of the TICC solver.
 """
 
-import collections
 import errno
 import os
 import time
@@ -15,18 +14,17 @@ import faiss
 import gmmx
 import jax
 import jax.numpy as jnp
+from functools import partial
 import matplotlib.pyplot as plt
 import pandas as pd
-import tqdm
 
-from ticc.jax_admm_solver import admm_solver
+from ticc.jax_admm_solver import admm_solver, upper2Full
 from ticc.TICC_helper import (
     compute_confusion_matrix,
     computeBIC,
     find_matching,
     getTrainTestSplit,
     updateClusters,
-    upperToFull,
 )
 
 
@@ -80,14 +78,12 @@ def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
         1e-6,  # eps_rel
     )
 
-    # Convert back to Python lists and create status strings
-    solutions_list = [np.array(sol) for sol in solutions]
-    status_list = [
-        "Optimal" if bool(flag) else "Incomplete: max iterations reached"
-        for flag in convergence_flags
-    ]
+    # Convert back to JAX arrays and create status strings
+    # Keep as JAX arrays since we're inside a JIT-compiled function
+    # Note: We don't return status_list in JAX implementation since it's not used
+    solutions_list = solutions  # Keep as JAX array
 
-    return solutions_list, status_list
+    return solutions_list, convergence_flags
 
 
 @jax.jit
@@ -203,6 +199,399 @@ def prepare_smoothen_data_for_jax(
     log_det_values = jnp.array(log_det_list)
 
     return cluster_means_stacked, inv_cov_matrices, log_det_values
+
+
+def prepare_initial_jax_state(
+    clustered_points,
+    complete_D_train,
+    number_of_clusters,
+    window_size,
+    time_series_col_size,
+    lambda_parameter,
+    biased,
+    prng_key,
+):
+    """
+    Create initial JAX state from numpy arrays and parameters.
+    """
+    # Initialize with dummy values that will be updated in first iteration
+    dummy_cov_size = window_size * time_series_col_size
+
+    initial_state = {
+        "clustered_points": jnp.array(clustered_points),
+        "computed_covariances": jnp.zeros(
+            (number_of_clusters, dummy_cov_size, dummy_cov_size)
+        ),
+        "cluster_means": jnp.zeros((number_of_clusters, 1, time_series_col_size)),
+        "cluster_means_stacked": jnp.zeros((number_of_clusters, dummy_cov_size)),
+        "train_cluster_inverses": jnp.zeros(
+            (number_of_clusters, dummy_cov_size, dummy_cov_size)
+        ),
+        "prng_key": prng_key,
+        "converged": False,
+    }
+
+    return initial_state
+
+
+@jax.jit
+def update_clusters_jax(lle_matrix, switch_penalty):
+    """
+    JAX implementation of the updateClusters function using dynamic programming.
+    """
+    num_points, num_clusters = lle_matrix.shape
+
+    # Initialize DP table
+    dp = jnp.full((num_points, num_clusters), jnp.inf)
+
+    # Base case: first time point
+    dp = dp.at[0, :].set(lle_matrix[0, :])
+
+    def update_dp_row(carry, t):
+        dp_prev = carry
+
+        # For each cluster at time t
+        def compute_cluster_cost(k):
+            # Cost from staying in same cluster
+            same_cluster_cost = dp_prev[k] + lle_matrix[t, k]
+
+            # Cost from switching from any other cluster
+            def switch_cost_from_j(j):
+                return jnp.where(
+                    j == k,
+                    jnp.inf,  # Don't consider switching from same cluster
+                    dp_prev[j] + lle_matrix[t, k] + switch_penalty,
+                )
+
+            switch_costs = jax.vmap(switch_cost_from_j)(jnp.arange(num_clusters))
+            min_switch_cost = jnp.min(switch_costs)
+
+            return jnp.minimum(same_cluster_cost, min_switch_cost)
+
+        dp_current = jax.vmap(compute_cluster_cost)(jnp.arange(num_clusters))
+        return dp_current, dp_current
+
+    # Run DP for all time points
+    _, dp_all = jax.lax.scan(update_dp_row, dp[0, :], jnp.arange(1, num_points))
+
+    # Reconstruct full DP table
+    dp_full = jnp.concatenate([dp[0:1, :], dp_all], axis=0)
+
+    # Backtrack to find optimal path
+    path = jnp.zeros(num_points, dtype=jnp.int32)
+
+    # Find best final cluster
+    final_cluster = jnp.argmin(dp_full[-1, :])
+
+    def backtrack_step(carry, t_rev):
+        current_cluster = carry
+        t = num_points - 1 - t_rev
+
+        # Use JAX conditional instead of Python if
+        def handle_final_point():
+            return current_cluster, current_cluster
+
+        def handle_regular_point():
+            # Check if we came from same cluster or switched
+            same_cost = dp_full[t, current_cluster] + lle_matrix[t + 1, current_cluster]
+
+            def check_switch_from_j(j):
+                switch_cost = (
+                    dp_full[t, j] + lle_matrix[t + 1, current_cluster] + switch_penalty
+                )
+                return jnp.abs(dp_full[t + 1, current_cluster] - switch_cost) < 1e-10, j
+
+            was_switch, prev_clusters = jax.vmap(check_switch_from_j)(
+                jnp.arange(num_clusters)
+            )
+
+            # If any switch matches, use the first one found
+            switched_from = jnp.where(
+                jnp.any(was_switch),
+                prev_clusters[jnp.argmax(was_switch)],
+                current_cluster,
+            )
+
+            # Choose based on which cost matches
+            prev_cluster = jnp.where(
+                jnp.abs(dp_full[t + 1, current_cluster] - same_cost) < 1e-10,
+                current_cluster,
+                switched_from,
+            )
+
+            return prev_cluster, prev_cluster
+
+        return jax.lax.cond(
+            t == num_points - 1, handle_final_point, handle_regular_point
+        )
+
+    _, path_reversed = jax.lax.scan(
+        backtrack_step, final_cluster, jnp.arange(num_points)
+    )
+
+    # Reverse path and set final cluster
+    path = jnp.concatenate([jnp.flip(path_reversed[1:]), jnp.array([final_cluster])])
+
+    return path
+
+
+def em_update_step(
+    state,
+    iteration,
+    complete_D_train,
+    window_size,
+    time_series_col_size,
+    lambda_parameter,
+    beta,
+    biased,
+    number_of_clusters,
+    cluster_reassignment,
+):
+    """
+    Single EM iteration step for JAX scan.
+    """
+    clustered_points = state["clustered_points"]
+    prng_key = state["prng_key"]
+
+    # Split PRNG key for this iteration
+    prng_key, subkey = jax.random.split(prng_key)
+
+    # Group points by cluster (M-step data preparation)
+    cluster_data_list = []
+    cluster_indices = []
+
+    # Process each cluster using JAX-compatible operations
+    for cluster in range(number_of_clusters):
+        # Find points assigned to this cluster using boolean mask
+        cluster_mask = clustered_points == cluster
+
+        # Use mask-based operations instead of indexing
+        # Weight each data point by whether it belongs to this cluster
+        weights = cluster_mask.astype(jnp.float32)
+        total_weight = jnp.sum(weights)
+
+        # Compute weighted statistics (equivalent to cluster statistics when total_weight > 0)
+        weighted_data = complete_D_train * weights[:, None]
+        cluster_mean_stacked = jnp.sum(weighted_data, axis=0) / jnp.maximum(
+            total_weight, 1.0
+        )
+
+        # Use dynamic slice instead of standard slicing for JAX compatibility
+        start_idx = (window_size - 1) * time_series_col_size
+        slice_size = time_series_col_size
+        cluster_mean = jax.lax.dynamic_slice(
+            cluster_mean_stacked, [start_idx], [slice_size]
+        )
+
+        # Compute empirical covariance using broadcasting
+        # Center the data for this cluster
+        centered_data = complete_D_train - cluster_mean_stacked
+        # Apply cluster mask to get only relevant data points
+        masked_centered = centered_data * weights[:, None]
+
+        # Compute covariance matrix only if cluster has points
+        # Use conditional to avoid division by zero
+        def compute_cluster_cov():
+            S = jnp.cov(masked_centered.T, bias=biased)
+            return S
+
+        def use_identity_cov():
+            # Return identity matrix for empty clusters
+            return jnp.eye(complete_D_train.shape[1])
+
+        S = jax.lax.cond(
+            total_weight > 0.5,  # At least one point in cluster
+            compute_cluster_cov,
+            use_identity_cov,
+        )
+
+        cluster_data_list.append(S)
+        cluster_indices.append(cluster)
+
+        # Update state with cluster statistics
+        state["cluster_means"] = (
+            state["cluster_means"].at[cluster, 0, :].set(cluster_mean)
+        )
+        state["cluster_means_stacked"] = (
+            state["cluster_means_stacked"].at[cluster, :].set(cluster_mean_stacked)
+        )
+
+    # Solve ADMM for all clusters if we have any data
+    if cluster_data_list:
+        solutions, _ = solve_all_clusters_vmap(
+            cluster_data_list, lambda_parameter, window_size
+        )
+
+        # Process ADMM solutions
+        for i, cluster in enumerate(cluster_indices):
+            val = solutions[i]
+            S_est = upper2Full(val)
+            cov_out = jnp.linalg.inv(S_est)
+
+            # Update state
+            state["computed_covariances"] = (
+                state["computed_covariances"].at[cluster, :, :].set(cov_out)
+            )
+            state["train_cluster_inverses"] = (
+                state["train_cluster_inverses"].at[cluster, :, :].set(S_est)
+            )
+
+    # E-step: Update cluster assignments using JAX smoothen_clusters
+    cluster_means_stacked, inv_cov_matrices, log_det_values = (
+        prepare_smoothen_data_for_jax_from_state(
+            state, number_of_clusters, window_size + 1, time_series_col_size
+        )
+    )
+
+    lle_all_points_clusters = smoothen_clusters_jax(
+        complete_D_train,
+        cluster_means_stacked,
+        inv_cov_matrices,
+        log_det_values,
+        window_size + 1,
+        time_series_col_size,
+    )
+
+    # Update cluster assignments
+    new_clustered_points = update_clusters_jax(lle_all_points_clusters, beta)
+
+    # Check convergence
+    converged = jnp.array_equal(clustered_points, new_clustered_points)
+
+    # Handle empty cluster reassignment (simplified version)
+    # Count points in each cluster
+    cluster_counts = jnp.array(
+        [jnp.sum(new_clustered_points == k) for k in range(number_of_clusters)]
+    )
+    has_empty_clusters = jnp.any(cluster_counts == 0)
+
+    # Simple reassignment: if cluster is empty, assign some random points to it
+    def reassign_empty_clusters():
+        key, new_subkey = jax.random.split(subkey)
+        # Find largest cluster
+        largest_cluster = jnp.argmax(cluster_counts)
+
+        # Instead of using jnp.where, use a mask-based approach
+        # Create a mask for points in the largest cluster
+        largest_cluster_mask = new_clustered_points == largest_cluster
+
+        # Use the mask to weight the selection
+        # Points in largest cluster get weight 1, others get weight 0
+        point_weights = largest_cluster_mask.astype(jnp.float32)
+
+        # Simple reassignment strategy: reassign first few points from largest cluster
+        updated_points = new_clustered_points
+
+        # For each cluster, if it's empty, reassign some points
+        for empty_cluster in range(number_of_clusters):
+            # Check if this cluster is empty
+            is_empty = cluster_counts[empty_cluster] == 0
+
+            # If empty, reassign a few points from largest cluster
+            def reassign_to_this_cluster():
+                # Find the first few points in the largest cluster
+                cumsum_weights = jnp.cumsum(point_weights)
+                # Get indices of first cluster_reassignment points in largest cluster
+                reassign_mask = (cumsum_weights <= cluster_reassignment) & (
+                    point_weights > 0
+                )
+
+                # Update cluster assignments for these points
+                new_assignments = jnp.where(
+                    reassign_mask, empty_cluster, updated_points
+                )
+                return new_assignments
+
+            updated_points = jax.lax.cond(
+                is_empty & (iteration > 0),
+                reassign_to_this_cluster,
+                lambda: updated_points,
+            )
+
+        return updated_points
+
+    final_clustered_points = jax.lax.cond(
+        has_empty_clusters & (iteration > 0),
+        reassign_empty_clusters,
+        lambda: new_clustered_points,
+    )
+
+    # Update state
+    new_state = {
+        **state,
+        "clustered_points": final_clustered_points,
+        "prng_key": prng_key,
+        "converged": converged,
+    }
+
+    return new_state, {"iteration": iteration, "converged": converged}
+
+
+def prepare_smoothen_data_for_jax_from_state(state, number_of_clusters, num_blocks, n):
+    """
+    Extract smoothen data from JAX state instead of dictionaries.
+    """
+    sub_features = (num_blocks - 1) * n
+
+    cluster_means_stacked = state["cluster_means_stacked"]
+    computed_covariances = state["computed_covariances"]
+
+    # Extract sub-matrices and compute inverses and log-dets
+    cov_sub_matrices = computed_covariances[:, :sub_features, :sub_features]
+    inv_cov_matrices = jax.vmap(jnp.linalg.inv)(cov_sub_matrices)
+    log_det_values = jax.vmap(lambda x: jnp.log(jnp.linalg.det(x)))(cov_sub_matrices)
+
+    return cluster_means_stacked, inv_cov_matrices, log_det_values
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "window_size",
+        "number_of_clusters",
+        "time_series_col_size",
+        "lambda_parameter",
+        "beta",
+        "maxIters",
+        "cluster_reassignment",
+        "biased",
+    ),
+)
+def ticc_jax_fit(
+    initial_state,
+    complete_D_train,
+    window_size,
+    time_series_col_size,
+    lambda_parameter,
+    beta,
+    maxIters,
+    cluster_reassignment,
+    biased,
+    number_of_clusters,
+):
+    """
+    JAX-compiled main TICC fitting loop using scan.
+    """
+
+    def scan_em_step(state, iteration):
+        return em_update_step(
+            state,
+            iteration,
+            complete_D_train,
+            window_size,
+            time_series_col_size,
+            lambda_parameter,
+            beta,
+            biased,
+            number_of_clusters,
+            cluster_reassignment,
+        )
+
+    final_state, history = jax.lax.scan(
+        scan_em_step, initial_state, jnp.arange(maxIters)
+    )
+
+    return final_state, history
 
 
 def log_parameters(lambda_parameter, switch_penalty, number_of_clusters, window_size):
@@ -383,6 +772,7 @@ def fit(
     compute_BIC=False,
     cluster_reassignment=20,
     biased=False,
+    seed=None,
 ):
     assert maxIters > 0
 
@@ -396,9 +786,7 @@ def fit(
     print("loading data took:", end - start)
 
     num_blocks = window_size + 1
-    str_NULL = prepare_out_directory(
-        prefix_string, lambda_parameter, number_of_clusters
-    )
+    prepare_out_directory(prefix_string, lambda_parameter, number_of_clusters)
 
     training_indices = getTrainTestSplit(time_series_rows_size, num_blocks, window_size)
     num_train_points = len(training_indices)
@@ -436,197 +824,71 @@ def fit(
     end = time.time()
     print(f"K-means initialization took {end - start:.4f} seconds")
 
-    # Simplified state dictionaries
+    # Use JAX-compiled implementation
+    print("Using JAX-compiled TICC implementation...")
+
+    # Prepare initial state
+    if seed is None:
+        seed = np.random.randint(0, 1 << 31)
+    prng_key = jax.random.PRNGKey(seed)
+    initial_state = prepare_initial_jax_state(
+        clustered_points,
+        complete_D_train,
+        number_of_clusters,
+        window_size,
+        time_series_col_size,
+        lambda_parameter,
+        biased,
+        prng_key,
+    )
+
+    # Run JAX-compiled fit
+    start = time.time()
+    final_state, history = ticc_jax_fit(
+        initial_state,
+        jnp.array(complete_D_train),
+        window_size,
+        time_series_col_size,
+        lambda_parameter,
+        beta,
+        maxIters,
+        cluster_reassignment,
+        biased,
+        number_of_clusters,
+    )
+    final_state["clustered_points"].block_until_ready()
+
+    # Extract results from final state
+    clustered_points = np.array(final_state["clustered_points"])
+
+    end = time.time()
+    print(f"JAX TICC fitting took {end - start:.4f} seconds")
+
+    # Convert JAX state back to dictionary format for compatibility
     train_cluster_inverse = {}
     computed_covariance = {}
     cluster_mean_info = {}
     cluster_mean_stacked_info = {}
     empirical_covariances = {}
-    old_clustered_points = None
 
-    for iters in tqdm.tqdm(range(maxIters)):
-        train_clusters_arr = collections.defaultdict(list)
-        for point, cluster_num in enumerate(clustered_points):
-            train_clusters_arr[cluster_num].append(point)
-
-        len_train_clusters = {
-            k: len(train_clusters_arr[k]) for k in range(number_of_clusters)
-        }
-
-        # JAX solver logic moved directly into fit loop
-        # Create empty list for cluster data
-        cluster_data_list = []
-        cluster_indices = []  # Track which clusters have data
-
-        # Loop to prepare D_train arrays for each cluster
-        for cluster in range(number_of_clusters):
-            cluster_length = len_train_clusters[cluster]
-            if cluster_length != 0:
-                indices = train_clusters_arr[cluster]
-                D_train = np.zeros([cluster_length, window_size * time_series_col_size])
-                for i in range(cluster_length):
-                    point = indices[i]
-                    D_train[i, :] = complete_D_train[point, :]
-
-                # Store cluster means
-                cluster_mean_info[number_of_clusters, cluster] = np.mean(
-                    D_train, axis=0
-                )[
-                    (window_size - 1) * time_series_col_size : window_size
-                    * time_series_col_size
-                ].reshape([1, time_series_col_size])
-                cluster_mean_stacked_info[number_of_clusters, cluster] = np.mean(
-                    D_train, axis=0
-                )
-
-                # Compute empirical covariance
-                S = np.cov(np.transpose(D_train), bias=biased)
-                empirical_covariances[cluster] = S
-
-                # Add to cluster data list for batch processing
-                cluster_data_list.append(S)
-                cluster_indices.append(cluster)
-
-        # Call JAX batch solver
-        if cluster_data_list:
-            solutions, convergence_status = solve_all_clusters_vmap(
-                cluster_data_list, lambda_parameter, window_size
-            )
-
-            # Process results and update dictionaries
-            for i, cluster in enumerate(cluster_indices):
-                val = solutions[i]
-                print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
-
-                # THIS IS THE SOLUTION
-                S_est = upperToFull(val, 0)
-                X2 = S_est
-                u, _ = np.linalg.eig(S_est)
-                cov_out = np.linalg.inv(X2)
-
-                # Store the covariance, inverse-covariance
-                computed_covariance[number_of_clusters, cluster] = cov_out
-                train_cluster_inverse[cluster] = X2
-
-        for cluster in range(number_of_clusters):
-            print(
-                "length of the cluster ",
-                cluster,
-                "------>",
-                len_train_clusters[cluster],
-            )
-
-        # Ensure all clusters have parameters, even if they are empty.
-        # This prevents KeyErrors in the prediction step.
-        if (
-            len(computed_covariance) > 0
-            and len(computed_covariance) < number_of_clusters
-        ):
-            valid_key = next(iter(computed_covariance))
-            valid_cov = computed_covariance[valid_key]
-            valid_mean = cluster_mean_info[valid_key]
-            valid_stacked_mean = cluster_mean_stacked_info[valid_key]
-            for cluster_num in range(number_of_clusters):
-                key = (number_of_clusters, cluster_num)
-                if key not in computed_covariance:
-                    computed_covariance[key] = valid_cov
-                    cluster_mean_info[key] = valid_mean
-                    cluster_mean_stacked_info[key] = valid_stacked_mean
-
-        print("OPTIMIZATION OF CLUSTERS COMPLETE")
-
-        # The trained_model is now much simpler
-        trained_model = {
-            "cluster_mean_info": cluster_mean_info,
-            "computed_covariance": computed_covariance,
-            "cluster_mean_stacked_info": cluster_mean_stacked_info,
-            "complete_D_train": complete_D_train,
-            "time_series_col_size": time_series_col_size,
-            "number_of_clusters": number_of_clusters,
-        }
-        clustered_points = predict_clusters(
-            trained_model, beta, num_blocks, window_size
+    for cluster in range(number_of_clusters):
+        # Convert arrays back to the expected dictionary format
+        computed_covariance[(number_of_clusters, cluster)] = np.array(
+            final_state["computed_covariances"][cluster]
         )
-
-        new_train_clusters = collections.defaultdict(list)
-        for point, cluster in enumerate(clustered_points):
-            new_train_clusters[cluster].append(point)
-
-        len_new_train_clusters = {
-            k: len(new_train_clusters[k]) for k in range(number_of_clusters)
-        }
-
-        # Empty cluster reassignment logic
-        if iters > 0 and 0 in len_new_train_clusters.values():
-            cluster_norms = [
-                (np.linalg.norm(computed_covariance.get((number_of_clusters, i), 0)), i)
-                for i in range(number_of_clusters)
-            ]
-            norms_sorted = sorted(cluster_norms, reverse=True)
-            valid_clusters = [
-                cp[1] for cp in norms_sorted if len_new_train_clusters[cp[1]] > 0
-            ]
-
-            if not valid_clusters:
-                continue  # Avoids crash if all clusters are empty
-
-            counter = 0
-            for cluster_num in range(number_of_clusters):
-                if len_new_train_clusters[cluster_num] == 0:
-                    cluster_selected = valid_clusters[counter % len(valid_clusters)]
-                    counter += 1
-
-                    print(
-                        f"Reassigning points to empty cluster {cluster_num} from cluster {cluster_selected}"
-                    )
-
-                    # Find a point in the largest cluster to seed the reassignment
-                    points_in_selected_cluster = new_train_clusters[cluster_selected]
-                    if not points_in_selected_cluster:
-                        continue
-                    start_point = np.random.choice(points_in_selected_cluster)
-
-                    for i in range(cluster_reassignment):
-                        point_to_move = start_point + i
-                        if point_to_move >= len(clustered_points):
-                            break
-
-                        clustered_points[point_to_move] = cluster_num
-
-                        # Copy the model parameters from the selected cluster
-                        key_to_set = (number_of_clusters, cluster_num)
-                        key_to_copy = (number_of_clusters, cluster_selected)
-                        computed_covariance[key_to_set] = computed_covariance[
-                            key_to_copy
-                        ]
-                        cluster_mean_stacked_info[key_to_set] = complete_D_train[
-                            point_to_move, :
-                        ]
-                        cluster_mean_info[key_to_set] = complete_D_train[
-                            point_to_move, (window_size - 1) * time_series_col_size :
-                        ]
-
-        for cluster_num in range(number_of_clusters):
-            print(
-                f"length of cluster #{cluster_num} ----> {np.sum(clustered_points == cluster_num)}"
-            )
-
-        write_plot(
-            clustered_points,
-            str_NULL,
-            training_indices,
-            number_of_clusters,
-            write_out_file,
-            lambda_parameter,
-            beta,
+        train_cluster_inverse[cluster] = np.array(
+            final_state["train_cluster_inverses"][cluster]
         )
-
-        if old_clustered_points is not None and np.array_equal(
-            old_clustered_points, clustered_points
-        ):
-            print("\n\nCONVERGED!!! BREAKING EARLY!!!")
-            break
-        old_clustered_points = clustered_points.copy()
+        cluster_mean_info[(number_of_clusters, cluster)] = np.array(
+            final_state["cluster_means"][cluster]
+        )
+        cluster_mean_stacked_info[(number_of_clusters, cluster)] = np.array(
+            final_state["cluster_means_stacked"][cluster]
+        )
+        # Empirical covariances not stored in state, set to dummy values
+        empirical_covariances[cluster] = computed_covariance[
+            (number_of_clusters, cluster)
+        ]
 
     # Final calculations remain the same
     train_confusion_matrix_EM = compute_confusion_matrix(
