@@ -1,27 +1,31 @@
 import numpy as np
 from numba import jit
 
+
 def getTrainTestSplit(m, num_blocks, num_stacked):
-    '''
+    """
     - m: number of observations
     - num_blocks: window_size + 1
     - num_stacked: window_size
     Returns:
     - sorted list of training indices
-    '''
+    """
     # Now splitting up stuff
     # split1 : Training and Test
     # split2 : Training and Test - different clusters
     training_percent = 1
     # list of training indices
     training_idx = np.random.choice(
-        m-num_blocks+1, size=int((m-num_stacked)*training_percent), replace=False)
+        m - num_blocks + 1,
+        size=int((m - num_stacked) * training_percent),
+        replace=False,
+    )
     # Ensure that the first and the last few points are in
     training_idx = list(training_idx)
     if 0 not in training_idx:
         training_idx.append(0)
     if m - num_stacked not in training_idx:
-        training_idx.append(m-num_stacked)
+        training_idx.append(m - num_stacked)
     training_idx = np.array(training_idx)
     return sorted(training_idx)
 
@@ -32,7 +36,7 @@ def upperToFull(a, eps=0):
     # a[ind] = 0
     a_copy = a.copy()
     a_copy[ind] = 0
-    n = int((-1 + np.sqrt(1 + 8*a.shape[0]))/2)
+    n = int((-1 + np.sqrt(1 + 8 * a.shape[0])) / 2)
     A = np.zeros((n, n))
     # A[np.triu_indices(n)] = a
     rows, cols = np.triu_indices(n)
@@ -45,8 +49,8 @@ def upperToFull(a, eps=0):
 def hex_to_rgb(value):
     """Return (red, green, blue) for the color given as #rrggbb."""
     lv = len(value)
-    out = tuple(int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
-    out = tuple([x/256.0 for x in out])
+    out = tuple(int(value[i : i + lv // 3], 16) for i in range(0, lv, lv // 3))
+    out = tuple([x / 256.0 for x in out])
     return out
 
 
@@ -63,8 +67,8 @@ def updateClusters(LLE_node_vals, switch_penalty=1):
     future_cost_vals = np.zeros(LLE_node_vals.shape)
 
     # compute future costs
-    for i in range(T-2, -1, -1):
-        j = i+1
+    for i in range(T - 2, -1, -1):
+        j = i + 1
         indicator = np.zeros(num_clusters)
         future_costs = future_cost_vals[j, :]
         lle_vals = LLE_node_vals[j, :]
@@ -81,14 +85,14 @@ def updateClusters(LLE_node_vals, switch_penalty=1):
     path[0] = curr_location
 
     # compute the path
-    for i in range(T-1):
-        j = i+1
+    for i in range(T - 1):
+        j = i + 1
         future_costs = future_cost_vals[j, :]
         lle_vals = LLE_node_vals[j, :]
         total_vals = future_costs + lle_vals + switch_penalty
         total_vals[int(path[i])] -= switch_penalty
 
-        path[i+1] = np.argmin(total_vals)
+        path[i + 1] = np.argmin(total_vals)
 
     # return the computed path
     return path
@@ -116,7 +120,9 @@ def find_matching(confusion_matrix):
     return path
 
 
-def computeF1Score_delete(num_cluster, matching_algo, actual_clusters, threshold_algo, save_matrix=False):
+def computeF1Score_delete(
+    num_cluster, matching_algo, actual_clusters, threshold_algo, save_matrix=False
+):
     """
     computes the F1 scores and returns a list of values
     """
@@ -125,14 +131,19 @@ def computeF1Score_delete(num_cluster, matching_algo, actual_clusters, threshold
         matched_cluster = matching_algo[cluster]
         true_matrix = actual_clusters[cluster]
         estimated_matrix = threshold_algo[matched_cluster]
-        if save_matrix: np.savetxt("estimated_matrix_cluster=" + str(
-            cluster)+".csv", estimated_matrix, delimiter=",", fmt="%1.4f")
+        if save_matrix:
+            np.savetxt(
+                "estimated_matrix_cluster=" + str(cluster) + ".csv",
+                estimated_matrix,
+                delimiter=",",
+                fmt="%1.4f",
+            )
         TP = 0
         TN = 0
         FP = 0
         FN = 0
-        for i in range(num_stacked*n):
-            for j in range(num_stacked*n):
+        for i in range(num_stacked * n):
+            for j in range(num_stacked * n):
                 if estimated_matrix[i, j] == 1 and true_matrix[i, j] != 0:
                     TP += 1.0
                 elif estimated_matrix[i, j] == 0 and true_matrix[i, j] == 0:
@@ -141,11 +152,11 @@ def computeF1Score_delete(num_cluster, matching_algo, actual_clusters, threshold
                     FP += 1.0
                 else:
                     FN += 1.0
-        precision = (TP)/(TP + FP)
+        precision = (TP) / (TP + FP)
         print("cluster #", cluster)
         print("TP,TN,FP,FN---------->", (TP, TN, FP, FN))
-        recall = TP/(TP + FN)
-        f1 = (2*precision*recall)/(precision + recall)
+        recall = TP / (TP + FN)
+        f1 = (2 * precision * recall) / (precision + recall)
         F1_score[cluster] = f1
     return F1_score
 
@@ -158,9 +169,11 @@ def compute_confusion_matrix(num_clusters, clustered_points_algo, sorted_indices
     seg_len = 400
     true_confusion_matrix = np.zeros((num_clusters, num_clusters))
     for point in range(len(clustered_points_algo)):
-        cluster = clustered_points_algo[point]
-        num = (int(sorted_indices_algo[point]/seg_len) % num_clusters)
-        true_confusion_matrix[int(num), int(cluster)] += 1
+        # Cast the cluster value to an integer
+        cluster = int(clustered_points_algo[point])
+
+        num = (sorted_indices_algo[point] // seg_len) % num_clusters
+        true_confusion_matrix[num, cluster] += 1
     return true_confusion_matrix
 
 
@@ -175,31 +188,34 @@ def computeF1_macro(confusion_matrix, matching, num_clusters):
     for cluster in range(num_clusters):
         matched_cluster = matching[cluster]
         permuted_confusion_matrix[:, cluster] = confusion_matrix[:, matched_cluster]
-# Compute the F1 score for every cluster
+    # Compute the F1 score for every cluster
     F1_score = 0
     for cluster in range(num_clusters):
-        TP = permuted_confusion_matrix[cluster,cluster]
-        FP = np.sum(permuted_confusion_matrix[:,cluster]) - TP
-        FN = np.sum(permuted_confusion_matrix[cluster,:]) - TP
-        precision = TP/(TP + FP)
-        recall = TP/(TP + FN)
-        f1 = stats.hmean([precision,recall])
+        TP = permuted_confusion_matrix[cluster, cluster]
+        FP = np.sum(permuted_confusion_matrix[:, cluster]) - TP
+        FN = np.sum(permuted_confusion_matrix[cluster, :]) - TP
+        precision = TP / (TP + FP)
+        recall = TP / (TP + FN)
+        f1 = stats.hmean([precision, recall])
         F1_score += f1
     F1_score /= num_clusters
     return F1_score
 
+
 def computeBIC(K, T, clustered_points, inverse_covariances, empirical_covariances):
-    '''
+    """
     empirical covariance and inverse_covariance should be dicts
     K is num clusters
     T is num samples
-    '''
+    """
     mod_lle = 0
-    
+
     threshold = 2e-5
     clusterParams = {}
     for cluster, clusterInverse in inverse_covariances.items():
-        mod_lle += np.log(np.linalg.det(clusterInverse)) - np.trace(np.dot(empirical_covariances[cluster], clusterInverse))
+        mod_lle += np.log(np.linalg.det(clusterInverse)) - np.trace(
+            np.dot(empirical_covariances[cluster], clusterInverse)
+        )
         clusterParams[cluster] = np.sum(np.abs(clusterInverse) > threshold)
     curr_val = -1
     non_zero_params = 0
@@ -207,4 +223,4 @@ def computeBIC(K, T, clustered_points, inverse_covariances, empirical_covariance
         if val != curr_val:
             non_zero_params += clusterParams[val]
             curr_val = val
-    return non_zero_params * np.log(T) - 2*mod_lle
+    return non_zero_params * np.log(T) - 2 * mod_lle

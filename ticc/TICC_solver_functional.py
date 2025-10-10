@@ -21,7 +21,7 @@ from ticc.TICC_helper import (
     compute_confusion_matrix,
     computeBIC,
 )
-from ticc.admm_solver import ADMMSolver
+from ticc.admm_solver import admm_solver
 import tqdm
 
 
@@ -106,11 +106,15 @@ def train_clusters(
             S = np.cov(np.transpose(D_train), bias=biased)
             empirical_covariances[cluster] = S
 
-            solver = ADMMSolver(lamb, window_size, size_blocks, 1, S)
             # apply to process pool
             optRes[cluster] = pool.apply_async(
-                solver,
+                admm_solver,
                 (
+                    S,
+                    lamb,
+                    window_size,
+                    size_blocks,
+                    1,  # rho
                     1000,
                     1e-6,
                     1e-6,
@@ -131,7 +135,7 @@ def optimize_clusters(
     for cluster in range(number_of_clusters):
         if optRes[cluster] is None:
             continue
-        val = optRes[cluster].get()
+        val, status = optRes[cluster].get()
         print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
         # THIS IS THE SOLUTION
         S_est = upperToFull(val, 0)
@@ -160,15 +164,15 @@ def smoothen_clusters(
     n,
     number_of_clusters,
     num_blocks,
-    window_size,
 ):
     clustered_points_len = len(complete_D_train)
     inv_cov_dict = {}  # cluster to inv_cov
     log_det_dict = {}  # cluster to log_det
     for cluster in range(number_of_clusters):
-        cov_matrix = computed_covariance[number_of_clusters, cluster][
+        cov_matrix = computed_covariance[(number_of_clusters, cluster)][
             0 : (num_blocks - 1) * n, 0 : (num_blocks - 1) * n
         ]
+
         inv_cov_matrix = np.linalg.inv(cov_matrix)
         log_det_cov = np.log(np.linalg.det(cov_matrix))  # log(det(sigma2|1))
         inv_cov_dict[cluster] = inv_cov_matrix
@@ -177,10 +181,10 @@ def smoothen_clusters(
     print("beginning the smoothening ALGORITHM")
     LLE_all_points_clusters = np.zeros([clustered_points_len, number_of_clusters])
     for point in range(clustered_points_len):
-        if point + window_size - 1 < complete_D_train.shape[0]:
+        if point + num_blocks - 2 < complete_D_train.shape[0]:
             for cluster in range(number_of_clusters):
                 cluster_mean_stacked = cluster_mean_stacked_info[
-                    number_of_clusters, cluster
+                    (number_of_clusters, cluster)
                 ]
                 x = (
                     complete_D_train[point, :]
@@ -292,7 +296,6 @@ def predict_clusters(
     else:
         test_data = trained_model["complete_D_train"]
 
-    # SMOOTHENING
     lle_all_points_clusters = smoothen_clusters(
         trained_model["cluster_mean_info"],
         trained_model["computed_covariance"],
@@ -301,7 +304,6 @@ def predict_clusters(
         trained_model["time_series_col_size"],
         trained_model["number_of_clusters"],
         num_blocks,
-        window_size,
     )
 
     # Update cluster points - using NEW smoothening
@@ -367,7 +369,7 @@ def fit(
     clustered_points = np.asarray(res.gmm.predict(complete_D_train)).flatten()
     end = time.time()
     print(f"GMM initialization took {end - start:.4f} seconds")
-    gmm_clustered_pts = clustered_points + 0
+    gmm_clustered_pts = clustered_points.copy()
 
     start = time.time()
     kmeans = faiss.Kmeans(d, number_of_clusters, niter=20, verbose=False, gpu=False)
@@ -379,14 +381,13 @@ def fit(
     end = time.time()
     print(f"K-means initialization took {end - start:.4f} seconds")
 
+    # Simplified state dictionaries
     train_cluster_inverse = {}
-    log_det_values = {}
     computed_covariance = {}
     cluster_mean_info = {}
     cluster_mean_stacked_info = {}
-    old_clustered_points = None
-
     empirical_covariances = {}
+    old_clustered_points = None
 
     ctx = mp.get_context("spawn")
     pool = ctx.Pool(processes=num_proc)
@@ -417,16 +418,32 @@ def fit(
         optimize_clusters(
             computed_covariance,
             len_train_clusters,
-            log_det_values,
+            {},  # log_det_values is not used elsewhere, so pass empty dict
             opt_res,
             train_cluster_inverse,
             number_of_clusters,
         )
 
-        old_computed_covariance = computed_covariance
+        # Ensure all clusters have parameters, even if they are empty.
+        # This prevents KeyErrors in the prediction step.
+        if (
+            len(computed_covariance) > 0
+            and len(computed_covariance) < number_of_clusters
+        ):
+            valid_key = next(iter(computed_covariance))
+            valid_cov = computed_covariance[valid_key]
+            valid_mean = cluster_mean_info[valid_key]
+            valid_stacked_mean = cluster_mean_stacked_info[valid_key]
+            for cluster_num in range(number_of_clusters):
+                key = (number_of_clusters, cluster_num)
+                if key not in computed_covariance:
+                    computed_covariance[key] = valid_cov
+                    cluster_mean_info[key] = valid_mean
+                    cluster_mean_stacked_info[key] = valid_stacked_mean
 
-        print("UPDATED THE OLD COVARIANCE")
+        print("OPTIMIZATION OF CLUSTERS COMPLETE")
 
+        # The trained_model is now much simpler
         trained_model = {
             "cluster_mean_info": cluster_mean_info,
             "computed_covariance": computed_covariance,
@@ -447,56 +464,59 @@ def fit(
             k: len(new_train_clusters[k]) for k in range(number_of_clusters)
         }
 
-        before_empty_cluster_assign = clustered_points.copy()
-
-        if iters != 0:
+        # Empty cluster reassignment logic
+        if iters > 0 and 0 in len_new_train_clusters.values():
             cluster_norms = [
-                (np.linalg.norm(old_computed_covariance[number_of_clusters, i]), i)
+                (np.linalg.norm(computed_covariance.get((number_of_clusters, i), 0)), i)
                 for i in range(number_of_clusters)
             ]
             norms_sorted = sorted(cluster_norms, reverse=True)
             valid_clusters = [
-                cp[1] for cp in norms_sorted if len_new_train_clusters[cp[1]] != 0
+                cp[1] for cp in norms_sorted if len_new_train_clusters[cp[1]] > 0
             ]
+
+            if not valid_clusters:
+                continue  # Avoids crash if all clusters are empty
 
             counter = 0
             for cluster_num in range(number_of_clusters):
                 if len_new_train_clusters[cluster_num] == 0:
-                    cluster_selected = valid_clusters[counter]
-                    counter = (counter + 1) % len(valid_clusters)
+                    cluster_selected = valid_clusters[counter % len(valid_clusters)]
+                    counter += 1
+
                     print(
-                        "cluster that is zero is:",
-                        cluster_num,
-                        "selected cluster instead is:",
-                        cluster_selected,
+                        f"Reassigning points to empty cluster {cluster_num} from cluster {cluster_selected}"
                     )
-                    start_point = np.random.choice(new_train_clusters[cluster_selected])
-                    for i in range(0, cluster_reassignment):
+
+                    # Find a point in the largest cluster to seed the reassignment
+                    points_in_selected_cluster = new_train_clusters[cluster_selected]
+                    if not points_in_selected_cluster:
+                        continue
+                    start_point = np.random.choice(points_in_selected_cluster)
+
+                    for i in range(cluster_reassignment):
                         point_to_move = start_point + i
                         if point_to_move >= len(clustered_points):
                             break
+
                         clustered_points[point_to_move] = cluster_num
-                        computed_covariance[number_of_clusters, cluster_num] = (
-                            old_computed_covariance[
-                                number_of_clusters, cluster_selected
-                            ]
-                        )
-                        cluster_mean_stacked_info[number_of_clusters, cluster_num] = (
-                            complete_D_train[point_to_move, :]
-                        )
-                        cluster_mean_info[number_of_clusters, cluster_num] = (
-                            complete_D_train[point_to_move, :][
-                                (window_size - 1) * time_series_col_size : window_size
-                                * time_series_col_size
-                            ]
-                        )
+
+                        # Copy the model parameters from the selected cluster
+                        key_to_set = (number_of_clusters, cluster_num)
+                        key_to_copy = (number_of_clusters, cluster_selected)
+                        computed_covariance[key_to_set] = computed_covariance[
+                            key_to_copy
+                        ]
+                        cluster_mean_stacked_info[key_to_set] = complete_D_train[
+                            point_to_move, :
+                        ]
+                        cluster_mean_info[key_to_set] = complete_D_train[
+                            point_to_move, (window_size - 1) * time_series_col_size :
+                        ]
 
         for cluster_num in range(number_of_clusters):
             print(
-                "length of cluster #",
-                cluster_num,
-                "-------->",
-                sum([x == cluster_num for x in clustered_points]),
+                f"length of cluster #{cluster_num} ----> {np.sum(clustered_points == cluster_num)}"
             )
 
         write_plot(
@@ -509,31 +529,18 @@ def fit(
             beta,
         )
 
-        train_confusion_matrix_EM = compute_confusion_matrix(
-            number_of_clusters, clustered_points, training_indices
-        )
-        train_confusion_matrix_GMM = compute_confusion_matrix(
-            number_of_clusters, gmm_clustered_pts, training_indices
-        )
-        train_confusion_matrix_kmeans = compute_confusion_matrix(
-            number_of_clusters, kmeans_clustered_pts, training_indices
-        )
-        matching_EM, matching_GMM, matching_Kmeans = compute_matches(
-            train_confusion_matrix_EM,
-            train_confusion_matrix_GMM,
-            train_confusion_matrix_kmeans,
-            number_of_clusters,
-        )
-
-        print("\n\n\n")
-
-        if np.array_equal(old_clustered_points, clustered_points):
-            print("\n\n\n\nCONVERGED!!! BREAKING EARLY!!!")
+        if old_clustered_points is not None and np.array_equal(
+            old_clustered_points, clustered_points
+        ):
+            print("\n\nCONVERGED!!! BREAKING EARLY!!!")
             break
-        old_clustered_points = before_empty_cluster_assign
+        old_clustered_points = clustered_points.copy()
+
     if pool is not None:
         pool.close()
         pool.join()
+
+    # Final calculations remain the same
     train_confusion_matrix_EM = compute_confusion_matrix(
         number_of_clusters, clustered_points, training_indices
     )
@@ -541,7 +548,13 @@ def fit(
         number_of_clusters, gmm_clustered_pts, training_indices
     )
     train_confusion_matrix_kmeans = compute_confusion_matrix(
-        number_of_clusters, clustered_points_kmeans, training_indices
+        number_of_clusters, kmeans_clustered_pts, training_indices
+    )
+    matching_EM, matching_GMM, matching_Kmeans = compute_matches(
+        train_confusion_matrix_EM,
+        train_confusion_matrix_GMM,
+        train_confusion_matrix_kmeans,
+        number_of_clusters,
     )
 
     compute_f_score(
