@@ -9,10 +9,10 @@ dependencies = [
     "numpy",
     "pandas",
     "scikit-learn",
-    "numba",
     "tqdm",
     "gmmx",
     "faiss-cpu",
+    "jax>=0.4.30",
 ]
 
 [build-system]

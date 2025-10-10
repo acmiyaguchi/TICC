@@ -1,15 +1,52 @@
 import numpy
 import math
-from numba import jit
 
 
-@jit(nopython=True)
 def _ij2symmetric(i, j, size):
     return (size * (size + 1)) / 2 - (size - i) * (size - i + 1) / 2 + j - i
 
 
-@jit(nopython=True)
-def _jitted_ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
+def upper2Full(a):
+    """Convert upper triangular matrix to full matrix"""
+    n = int((-1 + numpy.sqrt(1 + 8 * a.shape[0])) / 2)
+    A = numpy.zeros([n, n])
+    A[numpy.triu_indices(n)] = a
+    temp = A.diagonal()
+    A = (A + A.T) - numpy.diag(temp)
+    return A
+
+
+def Prox_logdet(S, A, eta):
+    """Proximal operator for log determinant"""
+    d, q = numpy.linalg.eigh(eta * A - S)
+    q = numpy.matrix(q)
+    X_var = (
+        (1 / (2 * float(eta)))
+        * q
+        * (
+            numpy.diag(
+                d + numpy.sqrt(numpy.square(d) + (4 * eta) * numpy.ones(d.shape))
+            )
+        )
+        * q.T
+    )
+    x_var = X_var[
+        numpy.triu_indices(S.shape[1])
+    ]  # extract upper triangular part as update variable
+    return numpy.matrix(x_var).T
+
+
+def ADMM_x(z, u, S, rho):
+    """ADMM update for x variable"""
+    a = z - u
+    A = upper2Full(a)
+    eta = rho
+    x_update = Prox_logdet(S, A, eta)
+    return numpy.array(x_update).T.reshape(-1)
+
+
+def ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
+    """ADMM update for z variable"""
     a = x + u
     probSize = numBlocks * sizeBlocks
     z_update = numpy.zeros(length)
@@ -61,50 +98,6 @@ def _jitted_ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
                 for index in indices:
                     z_update[int(index)] = ans
     return z_update
-
-
-def upper2Full(a):
-    """Convert upper triangular matrix to full matrix"""
-    n = int((-1 + numpy.sqrt(1 + 8 * a.shape[0])) / 2)
-    A = numpy.zeros([n, n])
-    A[numpy.triu_indices(n)] = a
-    temp = A.diagonal()
-    A = (A + A.T) - numpy.diag(temp)
-    return A
-
-
-def Prox_logdet(S, A, eta):
-    """Proximal operator for log determinant"""
-    d, q = numpy.linalg.eigh(eta * A - S)
-    q = numpy.matrix(q)
-    X_var = (
-        (1 / (2 * float(eta)))
-        * q
-        * (
-            numpy.diag(
-                d + numpy.sqrt(numpy.square(d) + (4 * eta) * numpy.ones(d.shape))
-            )
-        )
-        * q.T
-    )
-    x_var = X_var[
-        numpy.triu_indices(S.shape[1])
-    ]  # extract upper triangular part as update variable
-    return numpy.matrix(x_var).T
-
-
-def ADMM_x(z, u, S, rho):
-    """ADMM update for x variable"""
-    a = z - u
-    A = upper2Full(a)
-    eta = rho
-    x_update = Prox_logdet(S, A, eta)
-    return numpy.array(x_update).T.reshape(-1)
-
-
-def ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
-    """ADMM update for z variable"""
-    return _jitted_ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length)
 
 
 def ADMM_u(u, x, z):

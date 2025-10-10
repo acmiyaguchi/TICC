@@ -1,5 +1,4 @@
 import numpy as np
-from numba import jit
 
 
 def getTrainTestSplit(m, num_blocks, num_stacked):
@@ -30,7 +29,6 @@ def getTrainTestSplit(m, num_blocks, num_stacked):
     return sorted(training_idx)
 
 
-@jit(nopython=True)
 def upperToFull(a, eps=0):
     ind = (a < eps) & (a > -eps)
     # a[ind] = 0
@@ -54,7 +52,6 @@ def hex_to_rgb(value):
     return out
 
 
-@jit(nopython=True)
 def updateClusters(LLE_node_vals, switch_penalty=1):
     """
     Takes in LLE_node_vals matrix and computes the path that minimizes
@@ -98,7 +95,6 @@ def updateClusters(LLE_node_vals, switch_penalty=1):
     return path
 
 
-@jit(nopython=True)
 def find_matching(confusion_matrix):
     """
     returns the perfect matching
@@ -161,7 +157,6 @@ def computeF1Score_delete(
     return F1_score
 
 
-@jit(nopython=True)
 def compute_confusion_matrix(num_clusters, clustered_points_algo, sorted_indices_algo):
     """
     computes a confusion matrix and returns it
