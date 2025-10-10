@@ -2,29 +2,32 @@
 This file contains a functional implementation of the TICC solver.
 """
 
-import numpy as np
-import math, time, collections, os, errno, sys, code, random
+import collections
+import errno
+import os
+import time
+
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import gmmx
 import faiss
+import gmmx
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import pandas as pd
-import multiprocessing as mp
+import tqdm
 
+from ticc.jax_admm_solver import admm_solver
 from ticc.TICC_helper import (
-    getTrainTestSplit,
-    upperToFull,
-    updateClusters,
-    find_matching,
     compute_confusion_matrix,
     computeBIC,
+    find_matching,
+    getTrainTestSplit,
+    updateClusters,
+    upperToFull,
 )
-from ticc.admm_solver import admm_solver
-import jax.numpy as jnp
-import jax
-import tqdm
 
 
 def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
@@ -58,12 +61,9 @@ def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
     S_batch = jnp.stack([jnp.array(S) for S in cluster_data_list])
     lamb_batch = jnp.stack(lamb_matrices)
 
-    # Import the JIT version directly to avoid status string conversion issues
-    from ticc.jax_admm_solver import admm_solver_jit
-    
     # Create vectorized version of the JAX ADMM solver JIT function
     batch_solver = jax.vmap(
-        admm_solver_jit,
+        admm_solver,
         in_axes=(0, 0, None, None, None, None, None, None),
         out_axes=(0, 0),
     )
@@ -82,8 +82,10 @@ def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
 
     # Convert back to Python lists and create status strings
     solutions_list = [np.array(sol) for sol in solutions]
-    status_list = ["Optimal" if bool(flag) else "Incomplete: max iterations reached" 
-                   for flag in convergence_flags]
+    status_list = [
+        "Optimal" if bool(flag) else "Incomplete: max iterations reached"
+        for flag in convergence_flags
+    ]
 
     return solutions_list, status_list
 
@@ -130,164 +132,6 @@ def stack_training_data(Data, n, num_train_points, training_indices, window_size
                 idx_k = training_indices[i + k]
                 complete_D_train[i][k * n : (k + 1) * n] = Data[idx_k][0:n]
     return complete_D_train
-
-
-def optimize_clusters_multiprocessing(
-    cluster_mean_info,
-    cluster_mean_stacked_info,
-    complete_D_train,
-    empirical_covariances,
-    len_train_clusters,
-    n,
-    pool,
-    train_clusters_arr,
-    number_of_clusters,
-    window_size,
-    lambda_parameter,
-    biased,
-    computed_covariance,
-    train_cluster_inverse,
-):
-    """Combined function that does both training and optimization using multiprocessing."""
-    # Part 1: Train clusters (from old train_clusters function)
-    optRes = [None for i in range(number_of_clusters)]
-    for cluster in range(number_of_clusters):
-        cluster_length = len_train_clusters[cluster]
-        if cluster_length != 0:
-            size_blocks = n
-            indices = train_clusters_arr[cluster]
-            D_train = np.zeros([cluster_length, window_size * n])
-            for i in range(cluster_length):
-                point = indices[i]
-                D_train[i, :] = complete_D_train[point, :]
-
-            cluster_mean_info[number_of_clusters, cluster] = np.mean(D_train, axis=0)[
-                (window_size - 1) * n : window_size * n
-            ].reshape([1, n])
-            cluster_mean_stacked_info[number_of_clusters, cluster] = np.mean(
-                D_train, axis=0
-            )
-            ##Fit a model - OPTIMIZATION
-            probSize = window_size * size_blocks
-            lamb = np.zeros((probSize, probSize)) + lambda_parameter
-            S = np.cov(np.transpose(D_train), bias=biased)
-            empirical_covariances[cluster] = S
-
-            # apply to process pool
-            optRes[cluster] = pool.apply_async(
-                admm_solver,
-                (
-                    S,
-                    lamb,
-                    window_size,
-                    size_blocks,
-                    1,  # rho
-                    1000,
-                    1e-6,
-                    1e-6,
-                    False,
-                ),
-            )
-
-    # Part 2: Optimize clusters (from old optimize_clusters function)
-    for cluster in range(number_of_clusters):
-        if optRes[cluster] is None:
-            continue
-        val, status = optRes[cluster].get()
-        print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
-        # THIS IS THE SOLUTION
-        S_est = upperToFull(val, 0)
-        X2 = S_est
-        u, _ = np.linalg.eig(S_est)
-        cov_out = np.linalg.inv(X2)
-
-        # Store the log-det, covariance, inverse-covariance, cluster means, stacked means
-        computed_covariance[number_of_clusters, cluster] = cov_out
-        train_cluster_inverse[cluster] = X2
-
-    for cluster in range(number_of_clusters):
-        print(
-            "length of the cluster ",
-            cluster,
-            "------>",
-            len_train_clusters[cluster],
-        )
-
-
-def optimize_clusters_jax(
-    cluster_mean_info,
-    cluster_mean_stacked_info,
-    complete_D_train,
-    empirical_covariances,
-    len_train_clusters,
-    n,
-    train_clusters_arr,
-    number_of_clusters,
-    window_size,
-    lambda_parameter,
-    biased,
-    computed_covariance,
-    train_cluster_inverse,
-):
-    """JAX adapter function that prepares data and processes results."""
-    # Create empty list for cluster data
-    cluster_data_list = []
-    cluster_indices = []  # Track which clusters have data
-
-    # Loop to prepare D_train arrays for each cluster
-    for cluster in range(number_of_clusters):
-        cluster_length = len_train_clusters[cluster]
-        if cluster_length != 0:
-            indices = train_clusters_arr[cluster]
-            D_train = np.zeros([cluster_length, window_size * n])
-            for i in range(cluster_length):
-                point = indices[i]
-                D_train[i, :] = complete_D_train[point, :]
-
-            # Store cluster means
-            cluster_mean_info[number_of_clusters, cluster] = np.mean(D_train, axis=0)[
-                (window_size - 1) * n : window_size * n
-            ].reshape([1, n])
-            cluster_mean_stacked_info[number_of_clusters, cluster] = np.mean(
-                D_train, axis=0
-            )
-
-            # Compute empirical covariance
-            S = np.cov(np.transpose(D_train), bias=biased)
-            empirical_covariances[cluster] = S
-
-            # Add to cluster data list for batch processing
-            cluster_data_list.append(S)
-            cluster_indices.append(cluster)
-
-    # Call JAX batch solver
-    if cluster_data_list:
-        solutions, convergence_status = solve_all_clusters_vmap(
-            cluster_data_list, lambda_parameter, window_size
-        )
-
-        # Process results and update dictionaries
-        for i, cluster in enumerate(cluster_indices):
-            val = solutions[i]
-            print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
-
-            # THIS IS THE SOLUTION
-            S_est = upperToFull(val, 0)
-            X2 = S_est
-            u, _ = np.linalg.eig(S_est)
-            cov_out = np.linalg.inv(X2)
-
-            # Store the covariance, inverse-covariance
-            computed_covariance[number_of_clusters, cluster] = cov_out
-            train_cluster_inverse[cluster] = X2
-
-    for cluster in range(number_of_clusters):
-        print(
-            "length of the cluster ",
-            cluster,
-            "------>",
-            len_train_clusters[cluster],
-        )
 
 
 def smoothen_clusters(
@@ -523,8 +367,6 @@ def fit(
     empirical_covariances = {}
     old_clustered_points = None
 
-    ctx = mp.get_context("spawn")
-    pool = ctx.Pool(processes=num_proc)
     for iters in tqdm.tqdm(range(maxIters)):
         train_clusters_arr = collections.defaultdict(list)
         for point, cluster_num in enumerate(clustered_points):
@@ -534,39 +376,68 @@ def fit(
             k: len(train_clusters_arr[k]) for k in range(number_of_clusters)
         }
 
-        # optimize_clusters_multiprocessing(
-        #     cluster_mean_info,
-        #     cluster_mean_stacked_info,
-        #     complete_D_train,
-        #     empirical_covariances,
-        #     len_train_clusters,
-        #     time_series_col_size,
-        #     pool,
-        #     train_clusters_arr,
-        #     number_of_clusters,
-        #     window_size,
-        #     lambda_parameter,
-        #     biased,
-        #     computed_covariance,
-        #     train_cluster_inverse,
-        # )
+        # JAX solver logic moved directly into fit loop
+        # Create empty list for cluster data
+        cluster_data_list = []
+        cluster_indices = []  # Track which clusters have data
 
-        # Use JAX solver instead
-        optimize_clusters_jax(
-            cluster_mean_info,
-            cluster_mean_stacked_info,
-            complete_D_train,
-            empirical_covariances,
-            len_train_clusters,
-            time_series_col_size,
-            train_clusters_arr,
-            number_of_clusters,
-            window_size,
-            lambda_parameter,
-            biased,
-            computed_covariance,
-            train_cluster_inverse,
-        )
+        # Loop to prepare D_train arrays for each cluster
+        for cluster in range(number_of_clusters):
+            cluster_length = len_train_clusters[cluster]
+            if cluster_length != 0:
+                indices = train_clusters_arr[cluster]
+                D_train = np.zeros([cluster_length, window_size * time_series_col_size])
+                for i in range(cluster_length):
+                    point = indices[i]
+                    D_train[i, :] = complete_D_train[point, :]
+
+                # Store cluster means
+                cluster_mean_info[number_of_clusters, cluster] = np.mean(
+                    D_train, axis=0
+                )[
+                    (window_size - 1) * time_series_col_size : window_size
+                    * time_series_col_size
+                ].reshape([1, time_series_col_size])
+                cluster_mean_stacked_info[number_of_clusters, cluster] = np.mean(
+                    D_train, axis=0
+                )
+
+                # Compute empirical covariance
+                S = np.cov(np.transpose(D_train), bias=biased)
+                empirical_covariances[cluster] = S
+
+                # Add to cluster data list for batch processing
+                cluster_data_list.append(S)
+                cluster_indices.append(cluster)
+
+        # Call JAX batch solver
+        if cluster_data_list:
+            solutions, convergence_status = solve_all_clusters_vmap(
+                cluster_data_list, lambda_parameter, window_size
+            )
+
+            # Process results and update dictionaries
+            for i, cluster in enumerate(cluster_indices):
+                val = solutions[i]
+                print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
+
+                # THIS IS THE SOLUTION
+                S_est = upperToFull(val, 0)
+                X2 = S_est
+                u, _ = np.linalg.eig(S_est)
+                cov_out = np.linalg.inv(X2)
+
+                # Store the covariance, inverse-covariance
+                computed_covariance[number_of_clusters, cluster] = cov_out
+                train_cluster_inverse[cluster] = X2
+
+        for cluster in range(number_of_clusters):
+            print(
+                "length of the cluster ",
+                cluster,
+                "------>",
+                len_train_clusters[cluster],
+            )
 
         # Ensure all clusters have parameters, even if they are empty.
         # This prevents KeyErrors in the prediction step.
@@ -679,10 +550,6 @@ def fit(
             print("\n\nCONVERGED!!! BREAKING EARLY!!!")
             break
         old_clustered_points = clustered_points.copy()
-
-    if pool is not None:
-        pool.close()
-        pool.join()
 
     # Final calculations remain the same
     train_confusion_matrix_EM = compute_confusion_matrix(

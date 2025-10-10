@@ -150,7 +150,7 @@ def check_convergence_jit(x, z, z_old, u, rho, length, e_abs, e_rel):
     jax.jit,
     static_argnames=("num_stacked", "size_blocks", "maxIters", "eps_abs", "eps_rel"),
 )
-def admm_solver_jit(S, lamb, num_stacked, size_blocks, rho, maxIters, eps_abs, eps_rel):
+def admm_solver(S, lamb, num_stacked, size_blocks, rho, maxIters, eps_abs, eps_rel):
     """The fully JIT-compiled solver"""
     probSize = num_stacked * size_blocks
     length = int(probSize * (probSize + 1) / 2)
@@ -210,66 +210,3 @@ def admm_solver_jit(S, lamb, num_stacked, size_blocks, rho, maxIters, eps_abs, e
 
     any_converged = jnp.any(converged_history)
     return final_state["x"], any_converged
-
-
-# Wrapper function to maintain the original signature
-def admm_solver(
-    S,
-    lamb,
-    num_stacked,
-    size_blocks,
-    rho,
-    maxIters=1000,
-    eps_abs=1e-6,
-    eps_rel=1e-6,
-    verbose=False,
-    rho_update_func=None,
-):
-    """
-    Solve Sparse Inverse Covariance Selection problem via ADMM
-
-    Now fully JIT-compiled using jax.lax.scan for maximum performance!
-
-    Parameters:
-    -----------
-    S : jax.numpy.ndarray
-        Empirical covariance matrix
-    lamb : float
-        Regularization parameter
-    num_stacked : int
-        Number of blocks
-    size_blocks : int
-        Size of each block
-    rho : float
-        ADMM parameter
-    maxIters : int, optional
-        Maximum number of iterations
-    eps_abs : float, optional
-        Absolute tolerance
-    eps_rel : float, optional
-        Relative tolerance
-    verbose : bool, optional
-        Whether to print debug information (disabled in JIT version)
-    rho_update_func : callable, optional
-        Function to update rho (not supported in JIT version)
-
-    Returns:
-    --------
-    x : jax.numpy.ndarray
-        Solution to the problem
-    status : str
-        Status of the solver
-    """
-    # Call the JIT-compiled version
-    x_final, any_converged = admm_solver_jit(
-        S, lamb, num_stacked, size_blocks, rho, maxIters, eps_abs, eps_rel
-    )
-
-    # Convert status object back to a Python string if needed
-    status = "Optimal" if any_converged else "Incomplete: max iterations reached"
-
-    # Verbose and rho_update are not supported in the JIT version, handle outside if needed
-    if verbose:
-        print(f"JIT solver finished with status: {status}")
-
-    return x_final, status
