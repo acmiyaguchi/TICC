@@ -51,61 +51,37 @@ def ADMM_x(z, u, S, rho):
 
 @partial(jax.jit, static_argnames=("numBlocks", "sizeBlocks", "length"))
 def ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
-    """ADMM update for z variable - JAX-compatible implementation
-
-    Now fully JIT-compiled for maximum performance.
-    """
     a = x + u
     probSize = numBlocks * sizeBlocks
-
-    # Pre-compute maximum possible elems to avoid dynamic shapes
-    max_elems = numBlocks  # Maximum value of elems is numBlocks (when i=0)
+    max_elems = numBlocks
 
     def process_i_block(z_carry, i):
-        """Process all (j,k) combinations for a given i"""
-        elems = jnp.where(i == 0, numBlocks, (2 * numBlocks - 2 * i) / 2)
+        elems = jnp.where(i == 0, numBlocks, (2 * numBlocks - 2 * i) / 2.0)
 
         def process_j_block(z_inner, j):
-            """Process all k values for given (i,j)"""
-
             def process_k_value(z_k, k):
-                """Process single (i,j,k) combination"""
-                # Skip invalid combinations
                 valid = jnp.where(i == 0, k >= j, True)
 
                 def do_computation():
-                    # Use fixed-size array with masking
                     L_range = jnp.arange(max_elems)
-                    valid_L = L_range < elems.astype(int)
+                    valid_L = L_range < elems.astype(jnp.int32)
 
-                    # Create location lists (only valid entries matter)
                     locList_0 = (L_range + i) * sizeBlocks + j
                     locList_1 = L_range * sizeBlocks + k
 
-                    # Calculate lambda sum (mask invalid entries)
-                    if_zero_contrib = lamb[locList_0, locList_1] * valid_L
-                    if_nonzero_contrib = lamb[locList_1, locList_0] * valid_L
+                    locA = jnp.where(i == 0, locList_0, locList_1)
+                    locB = jnp.where(i == 0, locList_1, locList_0)
 
-                    lamSum = jnp.where(
-                        i == 0, jnp.sum(if_zero_contrib), jnp.sum(if_nonzero_contrib)
+                    lamSum = jnp.sum(lamb[locA, locB] * valid_L)
+
+                    indices_raw = jax.vmap(_ij2symmetric, in_axes=(0, 0, None))(
+                        locA, locB, probSize
                     )
 
-                    # Calculate symmetric indices - use vmap for vectorization
-                    def calc_sym_idx(l0, l1):
-                        return _ij2symmetric(l0, l1, probSize)
-
-                    indices_raw = jnp.where(
-                        i == 0,
-                        jax.vmap(calc_sym_idx)(locList_0, locList_1),
-                        jax.vmap(calc_sym_idx)(locList_1, locList_0),
-                    )
-
-                    # Calculate point sum (mask invalid entries)
-                    point_contribs = a[indices_raw.astype(int)] * valid_L
+                    point_contribs = a[indices_raw.astype(jnp.int32)] * valid_L
                     pointSum = jnp.sum(point_contribs)
                     rhoPointSum = rho * pointSum
 
-                    # Vectorized soft thresholding
                     ans = jnp.where(
                         rhoPointSum > lamSum,
                         jnp.maximum((rhoPointSum - lamSum) / (rho * elems), 0),
@@ -116,38 +92,26 @@ def ADMM_z(x, u, lamb, rho, numBlocks, sizeBlocks, length):
                         ),
                     )
 
-                    # Update z at valid indices only
-                    valid_indices = indices_raw.astype(int)
-                    # Use a loop-like update that only affects valid entries
-                    z_updated = jax.lax.fori_loop(
-                        0,
-                        max_elems,
-                        lambda i, z_temp: jnp.where(
-                            valid_L[i], z_temp.at[valid_indices[i]].set(ans), z_temp
-                        ),
-                        z_k,
-                    )
+                    indices_int = indices_raw.astype(jnp.int32)
+                    original_values = z_k[indices_int]
+                    update_values = jnp.where(valid_L, ans, original_values)
+                    z_updated = z_k.at[indices_int].set(update_values)
 
                     return z_updated
 
                 updated_z = jax.lax.cond(valid, do_computation, lambda: z_k)
-                return updated_z, None  # Return (carry, output) pair for scan
+                return updated_z, None
 
-            # Process all k values for this j
-            k_range = jnp.arange(sizeBlocks)
-            z_after_k, _ = jax.lax.scan(process_k_value, z_inner, k_range)
+            # This part of the scan structure is perfect as-is
+            z_after_k, _ = jax.lax.scan(
+                process_k_value, z_inner, jnp.arange(sizeBlocks)
+            )
             return z_after_k, None
 
-        # Process all j values for this i
-        j_range = jnp.arange(sizeBlocks)
-        z_after_j, _ = jax.lax.scan(process_j_block, z_carry, j_range)
+        z_after_j, _ = jax.lax.scan(process_j_block, z_carry, jnp.arange(sizeBlocks))
         return z_after_j, None
 
-    # Process all i values
-    i_range = jnp.arange(numBlocks)
-    z_init = jnp.zeros(length)
-    z_final, _ = jax.lax.scan(process_i_block, z_init, i_range)
-
+    z_final, _ = jax.lax.scan(process_i_block, jnp.zeros(length), jnp.arange(numBlocks))
     return z_final
 
 
@@ -191,44 +155,61 @@ def admm_solver_jit(S, lamb, num_stacked, size_blocks, rho, maxIters, eps_abs, e
     probSize = num_stacked * size_blocks
     length = int(probSize * (probSize + 1) / 2)
 
-    # The update step function you wrote
     def admm_step(state, iteration):
-        # ... (your admm_step logic) ...
-        x_prev, z_prev, u_prev, done = state
+        """Single ADMM iteration step with dictionary state for clarity"""
 
-        def update_fn():
+        # This function defines the logic for a single computation step.
+        def update_fn(operand_state):
+            x_prev, z_prev, u_prev = (
+                operand_state["x"],
+                operand_state["z"],
+                operand_state["u"],
+            )
+
             z_old = z_prev
             x_new = ADMM_x(z_prev, u_prev, S, rho)
-            # Pass static args explicitly
             z_new = ADMM_z(x_new, u_prev, lamb, rho, num_stacked, size_blocks, length)
             u_new = ADMM_u(u_prev, x_new, z_new)
+
             stop, _, _, _, _ = check_convergence_jit(
                 x_new, z_new, z_old, u_prev, rho, length, eps_abs, eps_rel
             )
             is_converged = jnp.where(iteration > 0, stop, False)
-            return x_new, z_new, u_new, is_converged
 
-        x, z, u, is_converged = jax.lax.cond(
-            done, lambda: (x_prev, z_prev, u_prev, False), update_fn
+            return {"x": x_new, "z": z_new, "u": u_new, "done": is_converged}
+
+        # If the previous state was 'done', just pass it through.
+        # Otherwise, run the update function.
+        new_state = jax.lax.cond(
+            state["done"],
+            lambda s: s,  # If done, the new state is the same as the old state.
+            update_fn,
+            state,  # Pass state as the operand to the selected function.
         )
 
-        new_done = done | is_converged
-        new_state = (x, z, u, new_done)
-        output = new_done
-        return new_state, output
+        # The final 'done' flag is a combination of its previous state and the new one.
+        final_done_flag = state["done"] | new_state["done"]
 
-    # Initialize state
-    initial_state = (jnp.zeros(length), jnp.zeros(length), jnp.zeros(length), False)
+        # Always carry forward the final 'done' status.
+        new_state["done"] = final_done_flag
+
+        return new_state, final_done_flag
+
+    # Initialize state with dictionary for clarity
+    initial_state = {
+        "x": jnp.zeros(length),
+        "z": jnp.zeros(length),
+        "u": jnp.zeros(length),
+        "done": False,
+    }
 
     # Run ADMM iterations using scan
     final_state, converged_history = jax.lax.scan(
         admm_step, initial_state, jnp.arange(maxIters)
     )
 
-    x_final, _, _, _ = final_state
     any_converged = jnp.any(converged_history)
-
-    return x_final, any_converged
+    return final_state["x"], any_converged
 
 
 # Wrapper function to maintain the original signature
