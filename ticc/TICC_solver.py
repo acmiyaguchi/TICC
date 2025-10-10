@@ -90,6 +90,121 @@ def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
     return solutions_list, status_list
 
 
+@jax.jit
+def calculate_lle(point_data, cluster_mean, inv_cov, log_det):
+    """
+    Calculate Log-Likelihood Error for a single data point against single cluster parameters.
+
+    Args:
+        point_data: Data point (vector)
+        cluster_mean: Cluster mean (vector)
+        inv_cov: Inverse covariance matrix
+        log_det: Log determinant of covariance matrix
+
+    Returns:
+        lle: Log-likelihood error (scalar)
+    """
+    x = point_data - cluster_mean
+    # Compute x^T * inv_cov * x + log_det
+    lle = jnp.dot(x, jnp.dot(inv_cov, x)) + log_det
+    return lle
+
+
+def smoothen_clusters_jax(
+    complete_D_train,
+    cluster_means_stacked,
+    inv_cov_matrices,
+    log_det_values,
+    num_blocks,
+    n,
+):
+    """
+    Memory-efficient JAX implementation of smoothen_clusters.
+    Uses lax.map for sequential processing of points and vmap for parallel processing of clusters.
+    """
+    clustered_points_len = complete_D_train.shape[0]
+    relevant_features = (num_blocks - 1) * n
+    relevant_means = cluster_means_stacked[:, :relevant_features]
+
+    # This inner function, vectorized over clusters, is perfect as-is.
+    # It calculates all LLEs for a single point in parallel.
+    lle_for_one_point = jax.vmap(calculate_lle, in_axes=(None, 0, 0, 0))
+
+    def compute_lles_for_point(point_idx):
+        # This wrapper handles the logic for a single point
+        valid = point_idx + num_blocks - 2 < clustered_points_len
+
+        def compute_lles():
+            point_data = complete_D_train[point_idx, :relevant_features]
+            return lle_for_one_point(
+                point_data, relevant_means, inv_cov_matrices, log_det_values
+            )
+
+        return jax.lax.cond(
+            valid, compute_lles, lambda: jnp.zeros(cluster_means_stacked.shape[0])
+        )
+
+    # FIX: Use jax.lax.map to iterate over points sequentially, saving memory.
+    LLE_all_points_clusters = jax.lax.map(
+        compute_lles_for_point, jnp.arange(clustered_points_len)
+    )
+
+    return LLE_all_points_clusters
+
+
+def prepare_smoothen_data_for_jax(
+    cluster_mean_stacked_info,
+    computed_covariance,
+    number_of_clusters,
+    num_blocks,
+    n,
+):
+    """
+    Convert dictionary-based cluster data to stacked JAX arrays for vectorized processing.
+
+    Args:
+        cluster_mean_stacked_info: Dictionary of cluster means
+        computed_covariance: Dictionary of covariance matrices
+        number_of_clusters: Number of clusters
+        num_blocks: Number of blocks
+        n: Feature dimension
+
+    Returns:
+        cluster_means_stacked: JAX array (num_clusters, num_features)
+        inv_cov_matrices: JAX array (num_clusters, sub_features, sub_features)
+        log_det_values: JAX array (num_clusters,)
+    """
+    # Extract relevant sub-matrix dimension
+    sub_features = (num_blocks - 1) * n
+
+    # Pre-allocate arrays
+    cluster_means_list = []
+    inv_cov_list = []
+    log_det_list = []
+
+    for cluster in range(number_of_clusters):
+        # Get cluster mean
+        cluster_mean = cluster_mean_stacked_info[(number_of_clusters, cluster)]
+        cluster_means_list.append(cluster_mean)
+
+        # Get covariance sub-matrix and compute inverse and log-det
+        cov_matrix = computed_covariance[(number_of_clusters, cluster)][
+            0:sub_features, 0:sub_features
+        ]
+        inv_cov_matrix = np.linalg.inv(cov_matrix)
+        log_det_cov = np.log(np.linalg.det(cov_matrix))
+
+        inv_cov_list.append(inv_cov_matrix)
+        log_det_list.append(log_det_cov)
+
+    # Convert to JAX arrays
+    cluster_means_stacked = jnp.array(cluster_means_list)
+    inv_cov_matrices = jnp.array(inv_cov_list)
+    log_det_values = jnp.array(log_det_list)
+
+    return cluster_means_stacked, inv_cov_matrices, log_det_values
+
+
 def log_parameters(lambda_parameter, switch_penalty, number_of_clusters, window_size):
     print("lam_sparse", lambda_parameter)
     print("switch_penalty", switch_penalty)
@@ -132,57 +247,6 @@ def stack_training_data(Data, n, num_train_points, training_indices, window_size
                 idx_k = training_indices[i + k]
                 complete_D_train[i][k * n : (k + 1) * n] = Data[idx_k][0:n]
     return complete_D_train
-
-
-def smoothen_clusters(
-    cluster_mean_info,
-    computed_covariance,
-    cluster_mean_stacked_info,
-    complete_D_train,
-    n,
-    number_of_clusters,
-    num_blocks,
-):
-    clustered_points_len = len(complete_D_train)
-    inv_cov_dict = {}  # cluster to inv_cov
-    log_det_dict = {}  # cluster to log_det
-    for cluster in range(number_of_clusters):
-        cov_matrix = computed_covariance[(number_of_clusters, cluster)][
-            0 : (num_blocks - 1) * n, 0 : (num_blocks - 1) * n
-        ]
-
-        inv_cov_matrix = np.linalg.inv(cov_matrix)
-        log_det_cov = np.log(np.linalg.det(cov_matrix))  # log(det(sigma2|1))
-        inv_cov_dict[cluster] = inv_cov_matrix
-        log_det_dict[cluster] = log_det_cov
-    # For each point compute the LLE
-    print("beginning the smoothening ALGORITHM")
-    LLE_all_points_clusters = np.zeros([clustered_points_len, number_of_clusters])
-    for point in range(clustered_points_len):
-        if point + num_blocks - 2 < complete_D_train.shape[0]:
-            for cluster in range(number_of_clusters):
-                cluster_mean_stacked = cluster_mean_stacked_info[
-                    (number_of_clusters, cluster)
-                ]
-                x = (
-                    complete_D_train[point, :]
-                    - cluster_mean_stacked[0 : (num_blocks - 1) * n]
-                )
-                inv_cov_matrix = inv_cov_dict[cluster]
-                log_det_cov = log_det_dict[cluster]
-                lle = (
-                    np.dot(
-                        x.reshape([1, (num_blocks - 1) * n]),
-                        np.dot(
-                            inv_cov_matrix,
-                            x.reshape([n * (num_blocks - 1), 1]),
-                        ),
-                    )
-                    + log_det_cov
-                )
-                LLE_all_points_clusters[point, cluster] = lle
-
-    return LLE_all_points_clusters
 
 
 def write_plot(
@@ -274,15 +338,28 @@ def predict_clusters(
     else:
         test_data = trained_model["complete_D_train"]
 
-    lle_all_points_clusters = smoothen_clusters(
-        trained_model["cluster_mean_info"],
-        trained_model["computed_covariance"],
-        trained_model["cluster_mean_stacked_info"],
-        test_data,
-        trained_model["time_series_col_size"],
-        trained_model["number_of_clusters"],
-        num_blocks,
+    # Use JAX vectorized smoothen_clusters for better performance
+    cluster_means_stacked, inv_cov_matrices, log_det_values = (
+        prepare_smoothen_data_for_jax(
+            trained_model["cluster_mean_stacked_info"],
+            trained_model["computed_covariance"],
+            trained_model["number_of_clusters"],
+            num_blocks,
+            trained_model["time_series_col_size"],
+        )
     )
+
+    lle_all_points_clusters = smoothen_clusters_jax(
+        jnp.array(test_data),
+        cluster_means_stacked,
+        inv_cov_matrices,
+        log_det_values,
+        num_blocks,
+        trained_model["time_series_col_size"],
+    )
+
+    # Convert back to numpy for compatibility with updateClusters
+    lle_all_points_clusters = np.array(lle_all_points_clusters)
 
     # Update cluster points - using NEW smoothening
     clustered_points = updateClusters(
