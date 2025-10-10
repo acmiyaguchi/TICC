@@ -348,96 +348,65 @@ def em_update_step(
     cluster_reassignment,
 ):
     """
-    Single EM iteration step for JAX scan.
+    Corrected single EM iteration step for JAX scan.
     """
     clustered_points = state["clustered_points"]
     prng_key = state["prng_key"]
-
-    # Split PRNG key for this iteration
     prng_key, subkey = jax.random.split(prng_key)
 
-    # Group points by cluster (M-step data preparation)
-    cluster_data_list = []
-    cluster_indices = []
+    # === M-STEP: Correctly compute statistics in parallel ===
 
-    # Process each cluster using JAX-compatible operations
-    for cluster in range(number_of_clusters):
-        # Find points assigned to this cluster using boolean mask
-        cluster_mask = clustered_points == cluster
+    # 1. Get cluster counts
+    cluster_counts = jnp.bincount(clustered_points, length=number_of_clusters)
+    safe_counts = jnp.maximum(cluster_counts, 1)
 
-        # Use mask-based operations instead of indexing
-        # Weight each data point by whether it belongs to this cluster
-        weights = cluster_mask.astype(jnp.float32)
-        total_weight = jnp.sum(weights)
+    # 2. Compute cluster means using segment_sum
+    cluster_sums = jax.ops.segment_sum(
+        complete_D_train, clustered_points, num_segments=number_of_clusters
+    )
+    cluster_means_stacked = cluster_sums / safe_counts[:, jnp.newaxis]
 
-        # Compute weighted statistics (equivalent to cluster statistics when total_weight > 0)
-        weighted_data = complete_D_train * weights[:, None]
-        cluster_mean_stacked = jnp.sum(weighted_data, axis=0) / jnp.maximum(
-            total_weight, 1.0
-        )
+    start_idx = (window_size - 1) * time_series_col_size
+    cluster_means = jax.vmap(
+        lambda x: jax.lax.dynamic_slice(x, [start_idx], [time_series_col_size])
+    )(cluster_means_stacked)
 
-        # Use dynamic slice instead of standard slicing for JAX compatibility
-        start_idx = (window_size - 1) * time_series_col_size
-        slice_size = time_series_col_size
-        cluster_mean = jax.lax.dynamic_slice(
-            cluster_mean_stacked, [start_idx], [slice_size]
-        )
+    # 3. Compute empirical covariances (S) using segment_sum
+    # This pattern correctly computes per-cluster covariance in a vectorized way.
+    def outer_product(x):
+        return jnp.outer(x, x)
 
-        # Compute empirical covariance using broadcasting
-        # Center the data for this cluster
-        centered_data = complete_D_train - cluster_mean_stacked
-        # Apply cluster mask to get only relevant data points
-        masked_centered = centered_data * weights[:, None]
+    centered_data = complete_D_train - cluster_means_stacked[clustered_points]
+    sum_of_outer_products = jax.ops.segment_sum(
+        jax.vmap(outer_product)(centered_data),
+        clustered_points,
+        num_segments=number_of_clusters,
+    )
 
-        # Compute covariance matrix only if cluster has points
-        # Use conditional to avoid division by zero
-        def compute_cluster_cov():
-            S = jnp.cov(masked_centered.T, bias=biased)
-            return S
+    # Denominator for covariance
+    cov_denom = jnp.maximum(cluster_counts - (1 - biased), 1)[
+        :, jnp.newaxis, jnp.newaxis
+    ]
+    S_batch = sum_of_outer_products / cov_denom
 
-        def use_identity_cov():
-            # Return identity matrix for empty clusters
-            return jnp.eye(complete_D_train.shape[1])
+    # 4. Solve ADMM for all clusters in parallel
+    solutions, _ = solve_all_clusters_vmap(list(S_batch), lambda_parameter, window_size)
+    solutions_stacked = jnp.stack(solutions)
 
-        S = jax.lax.cond(
-            total_weight > 0.5,  # At least one point in cluster
-            compute_cluster_cov,
-            use_identity_cov,
-        )
+    # 5. Process ADMM solutions and update state
+    S_est_batch = jax.vmap(upper2Full)(solutions_stacked)
+    cov_out_batch = jax.vmap(jnp.linalg.inv)(S_est_batch)
 
-        cluster_data_list.append(S)
-        cluster_indices.append(cluster)
+    # Update state with new JAX arrays
+    state = state.copy()  # Make state mutable for updates
+    state["computed_covariances"] = cov_out_batch
+    state["train_cluster_inverses"] = S_est_batch
+    state["cluster_means"] = cluster_means[:, jnp.newaxis, :]
+    state["cluster_means_stacked"] = cluster_means_stacked
 
-        # Update state with cluster statistics
-        state["cluster_means"] = (
-            state["cluster_means"].at[cluster, 0, :].set(cluster_mean)
-        )
-        state["cluster_means_stacked"] = (
-            state["cluster_means_stacked"].at[cluster, :].set(cluster_mean_stacked)
-        )
+    # === E-STEP: Update cluster assignments ===
 
-    # Solve ADMM for all clusters if we have any data
-    if cluster_data_list:
-        solutions, _ = solve_all_clusters_vmap(
-            cluster_data_list, lambda_parameter, window_size
-        )
-
-        # Process ADMM solutions
-        for i, cluster in enumerate(cluster_indices):
-            val = solutions[i]
-            S_est = upper2Full(val)
-            cov_out = jnp.linalg.inv(S_est)
-
-            # Update state
-            state["computed_covariances"] = (
-                state["computed_covariances"].at[cluster, :, :].set(cov_out)
-            )
-            state["train_cluster_inverses"] = (
-                state["train_cluster_inverses"].at[cluster, :, :].set(S_est)
-            )
-
-    # E-step: Update cluster assignments using JAX smoothen_clusters
-    cluster_means_stacked, inv_cov_matrices, log_det_values = (
+    cluster_means_stacked_smooth, inv_cov_matrices, log_det_values = (
         prepare_smoothen_data_for_jax_from_state(
             state, number_of_clusters, window_size + 1, time_series_col_size
         )
@@ -445,70 +414,55 @@ def em_update_step(
 
     lle_all_points_clusters = smoothen_clusters_jax(
         complete_D_train,
-        cluster_means_stacked,
+        cluster_means_stacked_smooth,
         inv_cov_matrices,
         log_det_values,
         window_size + 1,
         time_series_col_size,
     )
 
-    # Update cluster assignments
     new_clustered_points = update_clusters_jax(lle_all_points_clusters, beta)
 
     # Check convergence
     converged = jnp.array_equal(clustered_points, new_clustered_points)
 
-    # Handle empty cluster reassignment (simplified version)
-    # Count points in each cluster
-    cluster_counts = jnp.array(
-        [jnp.sum(new_clustered_points == k) for k in range(number_of_clusters)]
-    )
-    has_empty_clusters = jnp.any(cluster_counts == 0)
+    # === Empty Cluster Reassignment (Corrected Logic) ===
 
-    # Simple reassignment: if cluster is empty, assign some random points to it
+    new_cluster_counts = jnp.bincount(new_clustered_points, length=number_of_clusters)
+    has_empty_clusters = jnp.any(new_cluster_counts == 0)
+
+
     def reassign_empty_clusters():
-        key, new_subkey = jax.random.split(subkey)
-        # Find largest cluster
-        largest_cluster = jnp.argmax(cluster_counts)
+        reassign_key, _ = jax.random.split(subkey)
+        largest_cluster_id = jnp.argmax(new_cluster_counts)
 
-        # Instead of using jnp.where, use a mask-based approach
-        # Create a mask for points in the largest cluster
-        largest_cluster_mask = new_clustered_points == largest_cluster
+        # Get indices of points in the largest cluster, padded with -1 to keep a static shape.
+        largest_cluster_indices = jnp.where(
+            new_clustered_points == largest_cluster_id,
+            size=len(new_clustered_points),
+            fill_value=-1,
+        )[0]
 
-        # Use the mask to weight the selection
-        # Points in largest cluster get weight 1, others get weight 0
-        point_weights = largest_cluster_mask.astype(jnp.float32)
+        # 1. Create a boolean mask of valid indices (where index != -1).
+        is_valid_index = largest_cluster_indices != -1
 
-        # Simple reassignment strategy: reassign first few points from largest cluster
-        updated_points = new_clustered_points
+        # 2. Convert the mask to a float-based probability vector (weights).
+        weights = is_valid_index.astype(jnp.float32)
+        # Normalize the weights so they sum to 1.
+        weights /= jnp.maximum(jnp.sum(weights), 1e-10)
 
-        # For each cluster, if it's empty, reassign some points
-        for empty_cluster in range(number_of_clusters):
-            # Check if this cluster is empty
-            is_empty = cluster_counts[empty_cluster] == 0
+        # 3. Use the 'p' argument to sample from the full array using the weights.
+        # This will only select from indices where the weight is non-zero.
+        start_point_idx = jax.random.choice(
+            reassign_key, largest_cluster_indices, p=weights
+        )
 
-            # If empty, reassign a few points from largest cluster
-            def reassign_to_this_cluster():
-                # Find the first few points in the largest cluster
-                cumsum_weights = jnp.cumsum(point_weights)
-                # Get indices of first cluster_reassignment points in largest cluster
-                reassign_mask = (cumsum_weights <= cluster_reassignment) & (
-                    point_weights > 0
-                )
+        reassign_indices = start_point_idx + jnp.arange(cluster_reassignment)
+        reassign_indices = jnp.mod(reassign_indices, len(new_clustered_points))
 
-                # Update cluster assignments for these points
-                new_assignments = jnp.where(
-                    reassign_mask, empty_cluster, updated_points
-                )
-                return new_assignments
+        first_empty_cluster = jnp.argmin(new_cluster_counts)
 
-            updated_points = jax.lax.cond(
-                is_empty & (iteration > 0),
-                reassign_to_this_cluster,
-                lambda: updated_points,
-            )
-
-        return updated_points
+        return new_clustered_points.at[reassign_indices].set(first_empty_cluster)
 
     final_clustered_points = jax.lax.cond(
         has_empty_clusters & (iteration > 0),
@@ -516,10 +470,13 @@ def em_update_step(
         lambda: new_clustered_points,
     )
 
-    # Update state
+    # Update state for next iteration
     new_state = {
-        **state,
         "clustered_points": final_clustered_points,
+        "computed_covariances": state["computed_covariances"],
+        "cluster_means": state["cluster_means"],
+        "cluster_means_stacked": state["cluster_means_stacked"],
+        "train_cluster_inverses": state["train_cluster_inverses"],
         "prng_key": prng_key,
         "converged": converged,
     }
