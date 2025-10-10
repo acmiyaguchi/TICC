@@ -18,7 +18,7 @@ from functools import partial
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from ticc.jax_admm_solver import admm_solver, upper2Full
+from ticc.admm_solver import admm_solver, upper2Full
 from ticc.TICC_helper import (
     compute_confusion_matrix,
     computeBIC,
