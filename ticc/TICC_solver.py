@@ -27,6 +27,8 @@ from ticc.TICC_helper import (
     updateClusters,
 )
 
+import jpviz
+
 
 def solve_all_clusters_vmap(cluster_data_list, lambda_parameter, window_size):
     """
@@ -431,7 +433,6 @@ def em_update_step(
     new_cluster_counts = jnp.bincount(new_clustered_points, length=number_of_clusters)
     has_empty_clusters = jnp.any(new_cluster_counts == 0)
 
-
     def reassign_empty_clusters():
         reassign_key, _ = jax.random.split(subkey)
         largest_cluster_id = jnp.argmax(new_cluster_counts)
@@ -505,26 +506,26 @@ def prepare_smoothen_data_for_jax_from_state(state, number_of_clusters, num_bloc
     jax.jit,
     static_argnames=(
         "window_size",
-        "number_of_clusters",
         "time_series_col_size",
         "lambda_parameter",
         "beta",
         "maxIters",
         "cluster_reassignment",
         "biased",
+        "number_of_clusters",
     ),
 )
 def ticc_jax_fit(
     initial_state,
     complete_D_train,
-    window_size,
-    time_series_col_size,
-    lambda_parameter,
-    beta,
-    maxIters,
-    cluster_reassignment,
-    biased,
-    number_of_clusters,
+    window_size: int,
+    time_series_col_size: int,
+    lambda_parameter: float,
+    beta: float,
+    maxIters: int,
+    cluster_reassignment: int,
+    biased: bool,
+    number_of_clusters: int,
 ):
     """
     JAX-compiled main TICC fitting loop using scan.
@@ -722,14 +723,13 @@ def fit(
     lambda_parameter=11e-2,
     beta=400,
     maxIters=1000,
-    threshold=2e-5,
     write_out_file=False,
     prefix_string="",
-    num_proc=1,
     compute_BIC=False,
     cluster_reassignment=20,
     biased=False,
     seed=None,
+    jax_profile=False,
 ):
     assert maxIters > 0
 
@@ -801,6 +801,24 @@ def fit(
 
     # Run JAX-compiled fit
     start = time.time()
+    if jax_profile:
+        dot_graph = jpviz.draw(ticc_jax_fit, static_argnums=list(range(2, 10)))(
+            initial_state,
+            jnp.array(complete_D_train),
+            window_size,
+            time_series_col_size,
+            lambda_parameter,
+            beta,
+            maxIters,
+            cluster_reassignment,
+            biased,
+            number_of_clusters,
+        )
+        dot_graph.write(f"{prefix_string}jax.dot")
+        with open(f"{prefix_string}jax.svg", "wb") as f:
+            f.write(dot_graph.create_svg())
+        dot_graph.write_png(f"{prefix_string}jax.png")
+
     final_state, history = ticc_jax_fit(
         initial_state,
         jnp.array(complete_D_train),
