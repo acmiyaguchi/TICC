@@ -21,3 +21,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["ticc"]
+
+[tool.uv.sources]
+jpviz = { git = "https://github.com/acmiyaguchi/jaxpr-viz.git" }
+
+[dependency-groups]
+dev = [
+    "jpviz",
+]
